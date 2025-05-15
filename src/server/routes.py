@@ -1,0 +1,68 @@
+import asyncio
+import logging
+import json
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
+
+from src.server.schemas import ChatQuery # , StreamResponse # StreamResponse might be used if not directly yielding strings
+from src.server.services import stream_qa_responses, get_chat_engine
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+# Health check endpoint for the router
+@router.get("/health", tags=["Server Health"])
+async def health_check_router():
+    return {"status": "Router is healthy"}
+
+@router.post("/chat/stream", tags=["Chat"])
+async def stream_chat(query: ChatQuery):
+    """
+    Endpoint to stream chat responses.
+    Accepts a query and returns a streaming response of tokens.
+    """
+    logger.info(f"Received streaming chat request: {query.query}")
+    try:
+        # Ensure engine is initialized before starting the stream if it wasn't already
+        # This also helps in giving a quicker error if engine init fails right away.
+        engine = await get_chat_engine()
+        if not engine:
+            logger.error("Chat engine failed to initialize for /chat/stream endpoint.")
+            raise HTTPException(status_code=503, detail="Chat engine is not available.")
+
+        async def event_generator():
+            async for token in stream_qa_responses(query.query):
+                payload = {}
+                if token.startswith("Error:") or token.startswith("Sorry, an error occurred:"):
+                    # Log the error server-side
+                    logger.error(f"Error token in stream: {token}")
+                    payload = {"token": token, "error": True}
+                else:
+                    payload = {"token": token}
+                
+                yield f"data: {json.dumps(payload)}\n\n"
+                await asyncio.sleep(0.01) # Small delay to allow other tasks, if necessary
+            
+            # Signal end of stream
+            end_event_payload = {"event": "stream_end"}
+            yield f"data: {json.dumps(end_event_payload)}\n\n"
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+    
+    except HTTPException as http_exc: # Re-raise HTTPExceptions to be handled by FastAPI
+        raise http_exc
+    except Exception as e:
+        logger.error(f"Unexpected error in /chat/stream endpoint: {e}", exc_info=True)
+        # This will be caught by FastAPI's default error handling and result in a 500 error.
+        # For more specific client feedback on such errors, an HTTPException could be raised here.
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+# Example of a non-streaming endpoint (can be removed or adapted)
+@router.post("/chat/simple", tags=["Chat"])
+async def simple_chat(query: ChatQuery):
+    logger.info(f"Received simple chat request: {query.query}")
+    # This would require a non-streaming version in services.py
+    # For now, let's just acknowledge and return a placeholder
+    # response_text = await get_simple_qa_response(query.query)
+    # return {"response": response_text}
+    return {"message": "Simple chat endpoint placeholder. Implement if needed.", "query_received": query.query} 

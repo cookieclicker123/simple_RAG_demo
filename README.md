@@ -127,7 +127,7 @@ This project uses `uv` for package and environment management.
     ```
     This will process the documents, create embeddings, and store them in the `local_db/faiss_index` directory (path configurable in `src/config.py`).
 
-### 2. Chatting with Your Documents
+### 2. Chatting with Your Documents (CLI)
 
 *   Once documents are indexed, start the chat interface:
     ```bash
@@ -137,7 +137,24 @@ This project uses `uv` for package and environment management.
     ```
 *   Ask questions related to the content of your indexed documents. Type `exit` or `quit` to end the chat session.
 
-### 3. Interacting with the Research Project Assistant (Agent System)
+### 3. Running the FastAPI Server (API)
+
+*   Ensure dependencies are installed (including FastAPI and Uvicorn):
+    ```bash
+    uv pip install -e ".[dev]"
+    ```
+*   Start the FastAPI server using Uvicorn. From the project root directory (`simple_RAG_demo/`):
+    ```bash
+    uvicorn src.server.web_app:app --host 0.0.0.0 --port 8000 --reload
+    ```
+    Alternatively, you can run the `web_app.py` script directly (though `--reload` is more convenient for development):
+    ```bash
+    python src/server/web_app.py
+    ```
+*   Once the server is running, you can access the API documentation (Swagger UI) at `http://localhost:8000/api/docs` and ReDoc at `http://localhost:8000/api/redoc`.
+*   The streaming chat endpoint will be available at `POST http://localhost:8000/api/chat/stream`.
+
+### 4. Interacting with the Research Project Assistant (Agent System CLI)
 
 *   (Coming Soon) Once the agent system is implemented, you will run:
     ```bash
