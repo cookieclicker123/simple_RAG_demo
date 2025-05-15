@@ -1,0 +1,213 @@
+# Project Specification: Multi-Agent Research Assistant
+
+## 1. Overview
+
+This project aims to build a sophisticated "Research Project Assistant" as a multi-agent system. The system will be orchestrated by a Meta-Agent that delegates tasks to specialized sub-agents, including a RAG (Retrieval Augmented Generation) agent for querying local documents and a Web Search agent for online information gathering. The primary framework for agent development and orchestration will be Google's Agent Development Kit (ADK), with an emphasis on leveraging its features for session management, memory, dynamic routing, and evaluation.
+
+The project is an exercise in both cutting-edge AI agent development and professional software engineering best practices, including modular design, robust error handling, and comprehensive testing (to be implemented later).
+
+## 2. Core Technologies & Frameworks
+
+*   **Primary Agent Framework**: Google Agent Development Kit (ADK)
+*   **LLMs**:
+    *   Google Gemini 1.5 Flash (for speed/cost-sensitive tasks, or initial agent versions)
+    *   Google Gemini 1.5 Pro (for more complex reasoning, meta-agent decisions)
+    *   OpenAI GPT-4o-mini (as an alternative/fallback, already integrated for RAG)
+*   **RAG Pipeline Components (Existing)**:
+    *   LlamaIndex (for document parsing, indexing, core RAG components)
+    *   FAISS (vector store)
+    *   `BAAI/bge-small-en-v1.5` (embedding model)
+*   **Data Validation & Modeling**: Pydantic
+*   **Configuration**: Pydantic-Settings (from `.env` files)
+*   **Environment & Package Management**: `uv`
+*   **Potential Complements (if ADK lacks specific features)**:
+    *   PydanticAI (for deeper Pydantic-based agent/tool construction if needed)
+    *   OpenTelemetry (for tracing, if ADK's native observability needs enhancement)
+*   **To be Avoided if Possible**: LangChain (preference for ADK-native or custom solutions first).
+
+## 3. High-Level Agent Architecture
+
+A hierarchical multi-agent system:
+
+1.  **Meta-Agent (Orchestrator)**:
+    *   The primary user-facing agent.
+    *   Receives complex research requests.
+    *   Responsible for:
+        *   Understanding the user's overall goal.
+        *   Breaking down the request into sub-tasks.
+        *   Planning the execution of sub-tasks (potentially using ADK's dynamic routing or a simple planning mechanism).
+        *   Delegating sub-tasks to appropriate sub-agents.
+        *   Synthesizing results from sub-agents into a coherent final response.
+        *   Managing overall conversation state and long-term memory (leveraging ADK sessions/memory).
+    *   Implementation: ADK `LlmAgent` using Gemini 1.5 Pro.
+
+2.  **Sub-Agents**:
+    *   **RAG Agent**:
+        *   Specialized in querying and retrieving information from the indexed local document knowledge base.
+        *   Receives specific questions or information retrieval tasks from the Meta-Agent.
+        *   Tool: Custom RAG Tool (wrapping our existing `qa_service`).
+        *   Implementation: ADK `LlmAgent` or custom ADK `Agent`.
+    *   **Search Planner Agent**:
+        *   Receives research topics or broad information needs from the Meta-Agent.
+        *   Responsible for formulating effective search queries and a plan for web research.
+        *   May break down a complex search into multiple query steps.
+        *   Delegates actual web searches to the Web Search Agent.
+        *   Implementation: ADK `LlmAgent` using Gemini model.
+    *   **Web Search Agent**:
+        *   Specialized in executing web searches and summarizing findings.
+        *   Receives specific search queries from the Search Planner Agent.
+        *   Tool: Google Search tool (via ADK built-in tools if available, or custom tool wrapping Google Search API / Serper / Tavily).
+        *   Implementation: ADK `LlmAgent` or custom ADK `Agent`.
+
+## 4. Detailed Development Plan & Milestones
+
+### Phase 1: Foundational ADK Integration & RAG Agent (Current Focus)
+
+*   **Job 1.1: Environment & ADK Setup (Partially Done)**
+    *   Install `google-adk`. (Done)
+    *   Add `GEMINI_API_KEY` to `.env`, `.env.example`.
+    *   Update `src/config.py` to load and manage `GEMINI_API_KEY`.
+    *   Review ADK documentation thoroughly for best practices in agent/tool definition. ([ADK Docs](https://google.github.io/adk-docs/))
+
+*   **Job 1.2: Project Structure for Agents (Partially Done)**
+    *   Create `src/agents/`, `src/agents/sub_agents/`, `src/agents/tools/`. (Done)
+    *   Create placeholder files: `meta_agent.py`, `rag_agent.py`, `search_planner_agent.py`, `web_search_agent.py`, `rag_tool.py`. (Done for rag & meta, search planner, web search)
+    *   Update `README.md` with new architecture diagram and `agent_cli.py` usage.
+
+*   **Job 1.3: Wrap RAG Pipeline as an ADK Tool**
+    *   File: `src/agents/tools/rag_tool.py`
+    *   Define Pydantic input model (e.g., `RAGQueryInput(query: str)`).
+    *   Create a function that calls a refactored `qa_service` method. This method should initialize the chat engine (if not already) and perform a query, returning the textual response.
+        *   Consider if the `qa_service` needs a more tool-friendly interface (e.g., a function that takes a query and returns a string, managing engine initialization internally or accepting a pre-initialized engine).
+    *   Use `FunctionTool.from_function()` from ADK to wrap this.
+    *   Ensure robust error handling within the tool function.
+
+*   **Job 1.4: Implement Basic RAG Sub-Agent**
+    *   File: `src/agents/sub_agents/rag_agent.py`
+    *   Create an ADK `Agent` (e.g., `LlmAgent`).
+    *   Configure it with the RAG tool.
+    *   Develop a system prompt and few-shot examples (if needed by ADK `LlmAgent`) to guide it on how and when to use the RAG tool based on input tasks.
+    *   LLM: Gemini 1.5 Flash or GPT-4o-mini initially.
+
+*   **Job 1.5: Implement Basic Meta-Agent (Initial Version)**
+    *   File: `src/agents/meta_agent.py`
+    *   Create an ADK `LlmAgent` using Gemini 1.5 Pro (or Flash for initial tests).
+    *   Initial System Prompt: "You are a helpful research assistant. Given a query, determine if it can be answered by searching local documents. If so, delegate to the RAG Agent. Otherwise, state that you cannot answer yet."
+    *   Mechanism to invoke/delegate to the RAG Agent (e.g., using the RAG Agent as a tool, or ADK's agent-to-agent communication if applicable).
+
+*   **Job 1.6: Implement Basic Agent CLI**
+    *   File: `src/app/agent_cli.py`
+    *   Initialize the Meta-Agent.
+    *   Simple input loop to send queries to the Meta-Agent.
+    *   Display the Meta-Agent's final response (handle streaming if ADK supports it smoothly for agent interactions).
+
+### Phase 2: Web Search Capability & Enhanced Orchestration
+
+*   **Job 2.1: Implement Web Search Tool**
+    *   File: `src/agents/tools/web_search_tool.py` (new file)
+    *   Define Pydantic input (e.g., `SearchQueryInput(search_term: str)`).
+    *   Implement function to perform web search (e.g., using Google Custom Search JSON API or another search provider like Tavily/Serper). ADK may have built-in Google Search tools.
+    *   Wrap as ADK `FunctionTool`.
+
+*   **Job 2.2: Implement Web Search Sub-Agent**
+    *   File: `src/agents/sub_agents/web_search_agent.py`
+    *   ADK `LlmAgent` (Gemini 1.5 Flash).
+    *   Equip with the web search tool.
+    *   Prompt for effective web searching and concise summarization of results relevant to the query.
+
+*   **Job 2.3: Implement Search Planner Sub-Agent**
+    *   File: `src/agents/sub_agents/search_planner_agent.py`
+    *   ADK `LlmAgent` (Gemini 1.5 Pro/Flash).
+    *   No direct tools initially, its "tool" is invoking the `WebSearchAgent`.
+    *   Prompt to take a broad research topic, break it into actionable search queries, and plan a sequence of searches if needed.
+    *   For each query, it will delegate to the `WebSearchAgent`.
+    *   May synthesize results from multiple searches performed by the `WebSearchAgent`.
+
+*   **Job 2.4: Enhance Meta-Agent Orchestration**
+    *   Update Meta-Agent prompts and logic to decide between:
+        *   Delegating to RAG Agent (for local doc queries).
+        *   Delegating to Search Planner Agent (for web research needs).
+    *   Explore ADK's dynamic routing for this decision-making.
+    *   Start simple: keyword-based routing or LLM call to classify intent.
+    *   Develop logic for the Meta-Agent to synthesize information from both RAG and Search Planner/Web Search agents if a complex query requires it.
+
+*   **Job 2.5: Explore ADK Sessions & Memory**
+    *   Implement persistent session memory for the Meta-Agent in `agent_cli.py` using ADK's documented capabilities.
+    *   Ensure conversation history influences the Meta-Agent's planning and sub-agent task formulation.
+    *   Investigate how sub-agents manage their own short-term memory within an ADK session.
+
+### Phase 3: Advanced Features, Robustness & Evaluation
+
+*   **Job 3.1: Advanced Orchestration & Self-Correction**
+    *   Implement few-shot prompting for the Meta-Agent to improve decision-making.
+    *   Explore ADK's dynamic routing in more depth.
+    *   Enable Meta-Agent to generate QA pairs or self-critique steps:
+        *   After a sub-agent returns information, Meta-Agent asks clarifying questions or validates the information against the original request.
+        *   If not satisfied, it can re-prompt the sub-agent with more specific instructions or try an alternative sub-agent.
+
+*   **Job 3.2: Error Handling & Resilience**
+    *   Implement robust error handling in all agent and tool calls (e.g., API failures, tool execution errors, unexpected LLM outputs).
+    *   Use ADK's error handling patterns if available.
+    *   Integrate retry mechanisms for LLM calls and tool usage (e.g., using libraries like `tenacity`).
+    *   Define clear error messages to be propagated to the user via the Meta-Agent.
+
+*   **Job 3.3: Tracing & Observability with OpenTelemetry**
+    *   Investigate ADK's native observability features.
+    *   If needed, integrate OpenTelemetry for detailed tracing of agent-to-agent calls, tool usage, and LLM interactions. This will help in debugging and performance analysis.
+
+*   **Job 3.4: ADK Evaluation**
+    *   Define a set of evaluation test cases (queries and expected outcomes/behaviors) for the Research Project Assistant.
+    *   Use ADK's `evaluate` module to assess:
+        *   Task completion success.
+        *   Correctness of agent delegation.
+        *   Relevance and accuracy of information provided by RAG/Web Search.
+        *   Quality of the Meta-Agent's synthesized responses.
+
+### Phase 4: Future Enhancements (To Be Detailed Later)
+
+*   **Section 4.1: Additional Sub-Agents & Tools**
+    *   Diagram Analysis Agent (using Gemini vision capabilities).
+    *   Code Generation/Execution Agent (using ADK's code execution tools).
+    *   Data Analysis Agent (for structured data like CSVs).
+    *   Drafting/Summarization Agent (more advanced than simple tool-based summarization).
+
+*   **Section 4.2: Advanced RAG Techniques** (Internal to RAG Agent/Tool)
+    *   Hybrid Search (semantic + keyword).
+    *   Re-ranking (e.g., with cross-encoders).
+    *   Advanced parsing/chunking strategies.
+    *   Fine-tuning embedding models.
+    *   Knowledge Graph integration for RAG.
+    *   Addressing "lost in the middle" and other RAG challenges.
+
+*   **Section 4.3: Complex Document Understanding**
+    *   Techniques for integrating knowledge across multiple documents.
+    *   Handling complex tables, charts (tying into vision capabilities).
+
+*   **Section 4.4: User Interface**
+    *   Transition from CLI to a web interface (e.g., using FastAPI, Streamlit).
+
+*   **Section 4.5: Deployment**
+    *   Containerize the multi-agent system using Docker.
+    *   Explore deployment options suggested by ADK (Vertex AI Agent Engine, GKE, Cloud Run).
+
+## 5. Software Engineering & Best Practices (Ongoing)
+
+*   **Modularity**: Strict separation of concerns between agents, tools, services, and core logic.
+*   **Pydantic Models**: Rigorous use of Pydantic for all data interchange between components (agent inputs/outputs, tool schemas).
+*   **Configuration**: Centralized configuration management via `src/config.py` and `.env` files.
+*   **Type Hinting**: Consistent use of Python type hints across the codebase.
+*   **Static Analysis**:
+    *   `ruff` for linting and formatting (already in place).
+    *   `mypy` for static type checking (to be integrated into CI/CD later).
+*   **Testing (Future Implementation)**:
+    *   Unit tests for tools and individual agent logic (mocking dependencies).
+    *   Integration tests for agent interactions.
+    *   End-to-end tests using `agent_cli.py` and the ADK evaluation framework.
+*   **Logging**: Comprehensive and structured logging.
+*   **Version Control**: Regular commits with clear messages.
+*   **Documentation**:
+    *   `README.md` kept up-to-date.
+    *   This `spec.txt` file.
+    *   Code-level docstrings for all functions, classes, and modules.
+
+This spec will be versioned and updated as the project evolves.

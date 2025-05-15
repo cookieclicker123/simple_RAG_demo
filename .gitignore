@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# IDE / Editor specific
+.vscode/
+.idea/
+*.project
+*.classpath
+*.cproject
+*.launch
+*.settings
+*.tmproj
+*.sublime-workspace
+*.sublime-project
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Local data / DBs
+local_db/*
+!local_db/.gitkeep
+data/*
+!data/.gitkeep
+
+# Secrets / Environment variables
+.env
+*.env
+!.env.example
+
+# OS specific
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Coverage reports
+.coverage
+coverage.xml
+htmlcov/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+.ruff_cache/
+
+data2
+data
