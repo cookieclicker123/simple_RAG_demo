@@ -27,7 +27,7 @@ async def get_streaming_response(query: str):
                     logger.error(f"Error from server: {response.status_code} - {error_content.decode()}")
                     print(f"\nError: Received status {response.status_code} from server.", flush=True)
                     print(f"Details: {error_content.decode()}", flush=True)
-                    yield None # Signal error or end
+                    yield {"event": "error", "data": f"Server error: {response.status_code}"} # Yield error event
                     return
 
                 # Process the Server-Sent Events (SSE) stream
@@ -38,31 +38,31 @@ async def get_streaming_response(query: str):
                             data_json_str = buffer[len("data:"):].strip()
                             try:
                                 data = json.loads(data_json_str)
+                                # Always yield the full parsed data dictionary
+                                yield data 
                                 if data.get("event") == "stream_end":
-                                    logger.info("Stream ended by server signal.")
-                                    yield None # Signal end of stream
                                     break
-                                if data.get("error"):
-                                    error_message = data.get("token", "Unknown error from stream.")
-                                    logger.error(f"Received error in stream: {error_message}")
-                                    print(f"\nStream error: {error_message}", flush=True)
-                                    yield f"ERROR_TOKEN: {error_message}"
-                                elif "token" in data:
-                                    yield data["token"]
                             except json.JSONDecodeError:
                                 logger.error(f"Failed to decode JSON from stream: {data_json_str}")
+                                yield {"event": "error", "data": "Failed to decode stream data"}
                         buffer = ""
                     else:
                         buffer += line + "\n"
+        # Ensure stream_end is yielded if the loop finishes because of a break after stream_end from server
+        # or if the stream ends without an explicit server-side stream_end event (e.g. connection closed by server after data)
+        # However, if stream_end was already processed and yielded above, this would be redundant.
+        # The current logic yields data then breaks, so this additional yield might be okay or might need a flag.
+        # For now, let's assume the server always sends stream_end. If not, this might be needed.
+        # yield {"event": "stream_end"} # Re-evaluate if server doesn't always send stream_end
 
     except httpx.ConnectError as e:
         logger.error(f"Connection error: Could not connect to the server at {STREAM_CHAT_ENDPOINT}. Details: {e}")
-        print(f"\nError: Could not connect to the server at {STREAM_CHAT_ENDPOINT}. Please ensure it's running.", flush=True)
-        yield None
+        print(f"\nError: Could not connect to the server. Please ensure it's running.", flush=True)
+        yield {"event": "error", "data": "Connection error"}
     except Exception as e:
         logger.error(f"An unexpected error occurred while streaming: {e}", exc_info=True)
         print(f"\nAn unexpected error occurred: {e}", flush=True)
-        yield None
+        yield {"event": "error", "data": f"Unexpected streaming error: {e}"}
 
 async def main():
     print("Interactive Chat with RAG API (type 'exit' or 'quit' to end)")
@@ -86,29 +86,56 @@ async def main():
             continue
 
         print("AI: ", end="", flush=True)
-        # Keep track of tokens for logging if needed, but don't log the full response to console here.
-        # full_response_for_internal_log = [] 
-        has_printed_error_token = False
+        ai_response_printed = False
+        citations_to_print = []
+        stream_ended_properly = False
 
-        async for token in get_streaming_response(user_query):
-            if token is None:
-                if not print("[No response or connection failed]", flush=True) and not has_printed_error_token:
-                    pass # Avoids double printing error messages if already handled
+        async for event_data in get_streaming_response(user_query):
+            if not isinstance(event_data, dict): # Should not happen with the fix
+                logger.warning(f"Received non-dict event data: {event_data}")
+                continue
+
+            if event_data.get("event") == "stream_end":
+                stream_ended_properly = True
                 break
             
-            if token.startswith("ERROR_TOKEN:"):
-                has_printed_error_token = True
-            else:
-                print(token, end="", flush=True)
-                # full_response_for_internal_log.append(token)
+            if event_data.get("event") == "error":
+                print(f"\n[Error: {event_data.get('data', 'Unknown stream error')}]", flush=True)
+                ai_response_printed = True 
+                break 
+
+            if "token" in event_data:
+                token_text = event_data["token"]
+                if event_data.get("error"):
+                    print(f"\n[Stream error from server: {token_text}]", flush=True)
+                    ai_response_printed = True
+                else:
+                    print(token_text, end="", flush=True)
+                    ai_response_printed = True
+            elif "citations" in event_data:
+                citations_to_print = event_data["citations"]
         
+        if not ai_response_printed and not stream_ended_properly and not citations_to_print:
+            # This condition tries to catch cases where the stream might have broken abruptly
+            # without an explicit error event from get_streaming_response or a proper stream_end.
+            print("[No valid response or stream incomplete]", flush=True)
+        elif not ai_response_printed and not citations_to_print:
+             # This covers cases where stream ended (or errored out cleanly) but no actual tokens were printed
+             print("[No text content in response]", flush=True)
         print() 
+
+        if citations_to_print:
+            print("\n--- Citations ---")
+            for cit in citations_to_print:
+                print(f"  Document ID:   {cit.get('document_id', 'N/A')}")
+                print(f"  Document Name: {cit.get('document_name', 'N/A')}")
+                print(f"  Title:         {cit.get('document_title', 'N/A')}")
+                print(f"  File Path:     {cit.get('file_path', 'N/A')}")
+                print(f"  Page Label:    {cit.get('page_label', 'N/A')}")
+                print(f"  Snippet:       {cit.get('snippet', 'N/A')}\n")
+        
         logger.info(f"User query: {user_query}")
-        # If you still want to log the full response to a file or a different handler (not console),
-        # you could re-enable collecting tokens and log them using a logger not configured for console INFO.
-        # For now, this line is removed to prevent console duplication:
-        # if full_response_for_internal_log:
-        #     logger.info(f"Streamed AI response: {''.join(full_response_for_internal_log)}")
+        # Full AI response logging removed to avoid console duplication
 
 if __name__ == "__main__":
     try:

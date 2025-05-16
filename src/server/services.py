@@ -1,16 +1,16 @@
 import asyncio
 import logging
-from typing import AsyncGenerator
+from typing import AsyncGenerator, List, Union
 
 from llama_index.core.chat_engine.types import BaseChatEngine
 from llama_index.core import Settings as LlamaSettings
 
 from src.core.qa_service import initialize_chat_engine as sync_initialize_chat_engine, stream_chat_response as sync_stream_chat_response
-from src.config import settings
 from src.core.indexing_service import configure_llama_index_globals, get_active_settings
+from src.models import DocumentCitation
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=settings.log_level)
+# logging.basicConfig(level=settings.log_level) # Main app or web_app should configure this
 
 # Global chat engine instance
 # This is a simple approach; for robustness, consider FastAPI's lifespan events
@@ -47,23 +47,20 @@ async def get_chat_engine() -> BaseChatEngine | None:
                     logger.error("Failed to initialize chat engine for FastAPI service.")
     return _chat_engine_instance
 
-async def stream_qa_responses(query: str) -> AsyncGenerator[str, None]:
+async def stream_qa_responses(query: str) -> AsyncGenerator[Union[str, List[DocumentCitation]], None]:
     """
     Asynchronously streams responses from the QA service.
     """
     chat_engine = await get_chat_engine()
     if not chat_engine:
+        # Yield a string error token first, then an empty list for citations
         yield "Error: Chat engine not initialized."
+        yield [] 
         return
 
     logger.info(f"Streaming QA response for query: {query}")
     try:
-        # sync_stream_chat_response is a generator. We need to iterate over it
-        # in a way that doesn't block the asyncio event loop.
-        # We can wrap the synchronous generator in an asynchronous one.
-        # This is a simplified approach. For true async, the underlying chat_engine.stream_chat
-        # would ideally be async. LlamaIndex is moving towards more async support.
-        
+        # sync_stream_chat_response now yields strings (tokens) and then a List[DocumentCitation]
         # We'll run the synchronous generator in a separate thread
         # and yield items back to the async generator.
         
@@ -75,14 +72,16 @@ async def stream_qa_responses(query: str) -> AsyncGenerator[str, None]:
 
         def run_sync_generator_in_thread(loop: asyncio.AbstractEventLoop):
             try:
-                for token in sync_stream_chat_response(query, chat_engine):
+                for item in sync_stream_chat_response(query, chat_engine):
                     # Schedule queue.put in the main event loop
-                    asyncio.run_coroutine_threadsafe(queue.put(token), loop).result()
-                # Signal completion
-                asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
+                    asyncio.run_coroutine_threadsafe(queue.put(item), loop).result()
+                # Signal completion of all items (tokens + citations list)
+                asyncio.run_coroutine_threadsafe(queue.put(None), loop).result() # End of stream signal
             except Exception as e:
                 logger.error(f"Error in sync_stream_chat_response thread: {e}", exc_info=True)
+                # Send error token, then empty citation list, then end signal
                 asyncio.run_coroutine_threadsafe(queue.put(f"Error during streaming: {e}"), loop).result()
+                asyncio.run_coroutine_threadsafe(queue.put([]), loop).result() # Empty citations on error
                 asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
 
         # Start the synchronous generator in a separate thread
@@ -93,14 +92,15 @@ async def stream_qa_responses(query: str) -> AsyncGenerator[str, None]:
 
         # Consume from the queue in the async generator
         while True:
-            token = await queue.get()
-            if token is None: # End of stream signal
+            item = await queue.get()
+            if item is None: # End of stream signal
                 break
-            yield token
+            yield item # Yields strings (tokens) or List[DocumentCitation]
             queue.task_done() # Signal that the item has been processed
         
         thread.join() # Ensure the thread finishes
 
     except Exception as e:
         logger.error(f"Error in stream_qa_responses: {e}", exc_info=True)
-        yield f"Sorry, an error occurred: {e}" 
+        yield f"Sorry, an error occurred: {e}"
+        yield [] # Yield empty list for citations in case of error 

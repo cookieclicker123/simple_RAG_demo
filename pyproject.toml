@@ -34,8 +34,6 @@ dependencies = [
     "faiss-cpu>=1.7.0,<1.8.0",          # Local vector store (CPU version)
     "sentence-transformers>=2.2.0,<3.0.0", # Explicitly needed by HuggingFaceEmbedding
     "PyPDF2>=3.0.0,<4.0.0",             # For PDF parsing, if not fully handled by LlamaIndex's default readers
-                                        # LlamaIndex has SimpleDirectoryReader which handles PDFs.
-                                        # We can refine this if specific PDF features are needed.
     "google-adk>=0.1.0,<0.2.0",          # Added Google Agent Development Kit
     "fastapi>=0.115.0,<1.0.0",        # For creating the API server (version updated)
     "uvicorn[standard]>=0.34.0,<1.0.0", # ASGI server to run FastAPI (version updated)
