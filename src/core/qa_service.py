@@ -1,8 +1,11 @@
 # Service for Question Answering: conversational retrieval, memory, and LLM interaction.
 
 import logging
-from typing import Generator, List, Union, Dict
+from typing import Generator, List, Union, Dict, Optional
 from pathlib import Path
+from datetime import datetime, timezone
+import json
+import math # Added for sigmoid function
 
 # LlamaIndex imports
 from llama_index.core import VectorStoreIndex, Settings as LlamaSettings
@@ -10,23 +13,38 @@ from llama_index.core.chat_engine.types import BaseChatEngine, StreamingAgentCha
 from llama_index.core.schema import NodeWithScore
 from llama_index.llms.openai import OpenAI as LlamaIndexOpenAI
 from llama_index.core.llms import ChatMessage, MessageRole
+from llama_index.core.postprocessor import SentenceTransformerRerank
+from llama_index.core.query_engine import RetrieverQueryEngine
+from llama_index.core.chat_engine import CondensePlusContextChatEngine
+from llama_index.core.callbacks import LlamaDebugHandler, CallbackManager
+from llama_index.core import get_response_synthesizer
+from llama_index.retrievers.bm25 import BM25Retriever
+from llama_index.core.retrievers import QueryFusionRetriever
 
 # LangChain imports for memory (though LlamaIndex chat engine can manage its own)
 # from langchain.memory import ConversationBufferMemory # Option 1: LangChain memory
 from llama_index.core.memory import ChatMemoryBuffer
 
 # Configuration and utility imports (using src. prefix as per your current setup)
-from src.config import settings
+from src.config import settings as app_settings
 from src.utils.vector_store_handlers import load_faiss_index_from_storage
-from src.models import DocumentCitation
+from src.models import DocumentCitation, RAGResponse, RAGSourceNodeDetail
 
 logger = logging.getLogger(__name__)
 # logging.basicConfig(level=settings.log_level) # BasicConfig should ideally be called once
 
+# Define project root and tmp directory path
+# Assuming this file (qa_service.py) is in src/core/
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+TMP_DIR = PROJECT_ROOT / "tmp"
+
+# Ensure TMP_DIR exists when module is loaded
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+
 # Explicitly configure/re-configure LlamaSettings.llm based on this module's view of settings.
 # This ensures that even if another module (like indexing_service) set it first with a different
 # value (e.g., from an old .env or different default), qa_service uses its configured LLM.
-current_llm_model_in_settings = settings.llm_model_name
+current_llm_model_in_settings = app_settings.llm_model_name
 llm_needs_configuration = True
 if LlamaSettings.llm and hasattr(LlamaSettings.llm, 'model'):
     if LlamaSettings.llm.model == current_llm_model_in_settings:
@@ -43,50 +61,105 @@ if llm_needs_configuration:
     try:
         LlamaSettings.llm = LlamaIndexOpenAI(
             model=current_llm_model_in_settings,
-            temperature=settings.temperature,
-            api_key=settings.openai_api_key,
-            max_tokens=settings.max_tokens
+            temperature=app_settings.temperature,
+            api_key=app_settings.openai_api_key,
+            max_tokens=app_settings.max_tokens
         )
     except Exception as e:
         logger.error(f"Failed to configure LlamaSettings.llm with {current_llm_model_in_settings}: {e}", exc_info=True)
         if not LlamaSettings.llm:
-            logger.warning("Falling back to a default gpt-3.5-turbo due to configuration error.")
-            LlamaSettings.llm = LlamaIndexOpenAI(model="gpt-3.5-turbo", temperature=settings.temperature, api_key=settings.openai_api_key)
+            logger.warning("Falling back to a default gpt-3.5-turbo due to configuration error during specific setup.")
+            LlamaSettings.llm = LlamaIndexOpenAI(model="gpt-3.5-turbo", temperature=app_settings.temperature, api_key=app_settings.openai_api_key)
+        # If LlamaSettings.llm was already set to something else before this specific configuration attempt and failed,
+        # it would retain its previous value. This block ensures a fallback ONLY if it's None after the try-except.
 
 def initialize_chat_engine() -> BaseChatEngine | None:
-    logger.info("Initializing chat engine...")
-    # logger.info(f"Attempting to use LLM: {LlamaSettings.llm.model if LlamaSettings.llm and hasattr(LlamaSettings.llm, 'model') else 'Not configured or unknown type'}") # Reduced noise
+    logger.info("Initializing chat engine with reranking and hybrid search...")
 
-    logger.info(f"Loading vector index from: {settings.vector_store_path}")
-    vector_index: VectorStoreIndex | None = load_faiss_index_from_storage(
-        vector_store_path_str=settings.vector_store_path
+    # Setup LlamaDebugHandler for detailed logging
+    llama_debug_handler = LlamaDebugHandler(print_trace_on_end=True)
+    logger.info(f"LlamaDebugHandler activated. Detailed LlamaIndex logs will be printed.") # This was for global, now local to engine
+
+    logger.info(f"Loading vector index and storage context from: {app_settings.vector_store_path}")
+    vector_index, storage_context = load_faiss_index_from_storage(
+        vector_store_path_str=app_settings.vector_store_path
     )
 
-    if not vector_index:
-        logger.error("Failed to load vector index. Cannot initialize chat engine.")
+    if not vector_index or not storage_context or not storage_context.docstore:
+        logger.error("Failed to load vector index, storage context, or docstore. Cannot initialize chat engine.")
         return None
-    # logger.info(f"Vector index loaded successfully. Index ID: {vector_index.index_id}") # Reduced noise
+    logger.info("Vector index and storage context (with docstore) loaded successfully.")
 
-    memory = ChatMemoryBuffer.from_defaults(token_limit=settings.chat_memory_token_limit if hasattr(settings, 'chat_memory_token_limit') else 3000)
-    logger.info(f"Chat memory (ChatMemoryBuffer) initialized with token limit: {memory.token_limit}")
+    # 1.a Create a dense retriever (from existing FAISS index)
+    vector_retriever = vector_index.as_retriever(similarity_top_k=app_settings.retriever_similarity_top_k)
+    logger.info(f"Vector retriever created with similarity_top_k={app_settings.retriever_similarity_top_k}.")
+
+    # 1.b Create BM25 sparse retriever on-the-fly from the loaded docstore
+    try:
+        all_nodes = list(storage_context.docstore.docs.values()) 
+        if not all_nodes:
+            logger.error("Docstore is empty, cannot initialize BM25Retriever.")
+            return None
+        
+        # TODO: For larger datasets, creating BM25Retriever on-the-fly at each QA service init can be slow.
+        # Investigate persisting the BM25 model/index during the main indexing pipeline (src/core/indexing_service.py).
+        # This might involve pickling the internal rank_bm25 object or checking for new persistence methods
+        # in future versions of llama-index-retrievers-bm25, as the direct .persist() method was not found.
+        logger.info(f"Creating BM25Retriever on-the-fly from {len(all_nodes)} nodes (similarity_top_k={app_settings.bm25_similarity_top_k})...")
+        bm25_retriever = BM25Retriever.from_defaults(
+            nodes=all_nodes,
+            similarity_top_k=app_settings.bm25_similarity_top_k
+        )
+        logger.info(f"BM25Retriever created successfully on-the-fly.")
+
+    except Exception as e:
+        logger.error(f"Failed to create BM25Retriever on-the-fly: {e}", exc_info=True)
+        return None
+
+    # 1.c Create a QueryFusionRetriever for hybrid search
+    # The QueryFusionRetriever will combine results before they go to the reranker.
+    # The similarity_top_k for QueryFusionRetriever is how many results it passes ON, 
+    # so it should be >= the individual retriever top_k values if you want to give the fusion process enough candidates.
+    # Let's make it sum of both, or a fixed larger number like our main retriever_similarity_top_k.
+    # For now, we'll set it to the main dense retriever's top_k, assuming it's the desired number of candidates for reranking.
+    hybrid_retriever = QueryFusionRetriever(
+        retrievers=[vector_retriever, bm25_retriever],
+        similarity_top_k=app_settings.retriever_similarity_top_k, # Number of results after fusion
+        num_queries=1,  # Set to > 1 for query expansion by the fusion retriever
+        mode="reciprocal_rerank", 
+        use_async=False, # Keep it sync for now with our current setup
+        verbose=True, # Enable verbose logging for the fusion retriever
+        callback_manager=CallbackManager([llama_debug_handler]) # For LlamaDebugHandler
+    )
+    logger.info("QueryFusionRetriever (hybrid) created.")
+
+    # 2. Initialize the reranker (cross-encoder)
+    reranker = SentenceTransformerRerank(
+        model=app_settings.reranker_model_name, 
+        top_n=app_settings.reranker_top_n # This is the final top_n after reranking the hybrid results
+    )
+    logger.info(f"SentenceTransformerRerank (cross-encoder) initialized with model='{app_settings.reranker_model_name}', top_n={app_settings.reranker_top_n}.")
 
     try:
-        chat_engine = vector_index.as_chat_engine(
-            chat_mode="condense_plus_context",
-            memory=memory,
-            verbose=settings.chat_engine_verbose if hasattr(settings, 'chat_engine_verbose') else True,
-            system_prompt=(
-                "You are a helpful and knowledgeable AI assistant. "
-                "Answer the user's questions based on the provided context. "
-                "If the context doesn't contain the answer, say that you don't know. "
-                "Be concise and informative."
-            ),
-            streaming=True
+        logger.info("Initializing RetrieverQueryEngine with hybrid retriever and reranker...")
+        
+        response_synthesizer = get_response_synthesizer(
+            llm=LlamaSettings.llm,
+            streaming=True,
+            callback_manager=CallbackManager([llama_debug_handler])
         )
-        logger.info("Chat engine initialized successfully.")
-        return chat_engine
+        logger.info("Streaming ResponseSynthesizer created.")
+
+        query_engine = RetrieverQueryEngine(
+            retriever=hybrid_retriever, # Use the hybrid retriever
+            response_synthesizer=response_synthesizer,
+            node_postprocessors=[reranker] # Reranker applied after hybrid retrieval + fusion
+        )
+        logger.info("RetrieverQueryEngine initialized successfully with hybrid retriever, reranker, and streaming synthesizer.")
+        return query_engine # type: ignore 
+
     except Exception as e:
-        logger.error(f"Error initializing chat engine: {e}", exc_info=True)
+        logger.error(f"Error initializing RetrieverQueryEngine: {e}", exc_info=True)
         return None
 
 def _get_title_for_chunk_from_llm(text_chunk: str, llm: LlamaIndexOpenAI, filename_stem: str) -> str | None:
@@ -171,37 +244,174 @@ def _create_document_citations(source_nodes: List[NodeWithScore], llm_for_titles
 
 def stream_chat_response(query: str, chat_engine: BaseChatEngine) -> Generator[Union[str, List[DocumentCitation]], None, None]:
     logger.info(f"User query (for streaming with citations): {query}")
+    # Accessing and printing debug information would ideally happen after the call.
+    # For now, the LlamaDebugHandler is set to print_trace_on_end=True, which should output to console.
+    # We can add more specific logging of its contents later if needed.
     try:
-        streaming_response: StreamingAgentChatResponse = chat_engine.stream_chat(query)
-        
-        # Yield tokens from the generator
-        if hasattr(streaming_response, 'response_gen'):
-            for token in streaming_response.response_gen:
-                yield token
-        else:
-            logger.warning("Streaming response object does not have 'response_gen'.")
-            if hasattr(streaming_response, 'response') and streaming_response.response:
-                 yield str(streaming_response.response) # Yield the whole response as one chunk
+        # Ensure this path is for RetrieverQueryEngine
+        if isinstance(chat_engine, RetrieverQueryEngine):
+            logger.info("Using RetrieverQueryEngine directly, with response_gen for streaming...")
+            
+            query_start_time = datetime.now(timezone.utc)
+            original_query = query # Capture original query
+            condensed_query_text = None # Placeholder, RQE doesn't readily expose this
+
+            response = chat_engine.query(query) # Call query(), expect Response object
+            
+            full_response_text_parts = []
+            # Yield tokens from the response_gen attribute
+            if hasattr(response, 'response_gen') and response.response_gen:
+                for token in response.response_gen:
+                    full_response_text_parts.append(token)
+                    yield token
+            elif response.response: 
+                logger.warning("RetrieverQueryEngine response does not have response_gen, yielding full response text.")
+                full_response_text_parts.append(str(response.response))
+                yield str(response.response)
             else:
-                yield "Error: Could not get a streamable or complete response."
-                # Early exit if no response parts can be obtained.
-                # Process source nodes even if response_gen is missing but source_nodes exist.
+                logger.warning("RetrieverQueryEngine response has no response_gen and no response text.")
+                full_response_text_parts.append("Error: Could not get a streamable or complete response from query engine.")
+                yield "Error: Could not get a streamable or complete response from query engine."
+            
+            final_answer_text = "".join(full_response_text_parts)
+
+            # Log and process source nodes after streaming is complete (or response is obtained)
+            source_nodes = response.source_nodes
+            source_node_details_for_rag: List[RAGSourceNodeDetail] = []
+
+            # Process source nodes for RAGResponse details AND for citations (titles are linked)
+            citations_generated: List[DocumentCitation] = [] # Initialize here
+            llm_for_titles_instance = LlamaSettings.llm
+            if not isinstance(llm_for_titles_instance, LlamaIndexOpenAI):
+                 logger.warning(f"LlamaSettings.llm (type: {type(llm_for_titles_instance)}) is not LlamaIndexOpenAI. Title extraction for RAGSourceNodeDetail might fail or use fallback.")
+
+            if source_nodes:
+                # First, create citations which also generates/extracts titles
+                citations_generated = _create_document_citations(source_nodes, llm_for_titles_instance) # type: ignore
+                
+                # Now, populate RAGSourceNodeDetail using titles from citations where possible
+                for i, node_ws in enumerate(source_nodes):
+                    node_content = node_ws.node.get_content()
+                    node_title = "N/A"
+                    # Try to find the corresponding citation for this node to reuse its title
+                    if i < len(citations_generated) and \
+                       citations_generated[i].file_path == node_ws.node.metadata.get("file_path") and \
+                       citations_generated[i].page_label == node_ws.node.metadata.get("page_label"):
+                       node_title = citations_generated[i].document_title or "N/A"
+                    else: # Fallback if no match or out of bounds, try to generate title for the current node
+                        logger.warning(f"Citation not matched or out of bounds for node {i}, attempting direct title generation.")
+                        if isinstance(llm_for_titles_instance, LlamaIndexOpenAI):
+                            generated_title_for_node = _get_title_for_chunk_from_llm(node_content, llm_for_titles_instance, Path(node_ws.node.metadata.get("file_path", "Unknown Document")).stem)
+                            if generated_title_for_node: 
+                                node_title = generated_title_for_node 
+                    
+                    normalized_node_score = None
+                    if node_ws.score is not None:
+                        try:
+                            normalized_node_score = 1 / (1 + math.exp(-node_ws.score)) # Sigmoid normalization
+                        except OverflowError:
+                            # Handle extreme scores that might cause overflow in math.exp()
+                            # If -node_ws.score is very large (node_ws.score very negative), exp result is huge -> normalized_score is near 0
+                            # If -node_ws.score is very small (node_ws.score very positive), exp result is near 0 -> normalized_score is near 1
+                            normalized_node_score = 0.0 if node_ws.score < 0 else 1.0 
+                            logger.warning(f"OverflowError during sigmoid normalization for score {node_ws.score}. Assigned {normalized_node_score}")
+
+                    source_node_details_for_rag.append(
+                        RAGSourceNodeDetail(
+                            node_id=node_ws.node.node_id,
+                            file_path=node_ws.node.metadata.get("file_path"),
+                            page_label=node_ws.node.metadata.get("page_label"),
+                            score=normalized_node_score, # Store normalized score
+                            node_title=node_title, 
+                            full_text_content=node_content # Store full content
+                        )
+                    )
+            # Do NOT yield citations_generated here anymore to keep terminal clean
+            # yield citations_generated 
+
+            query_end_time = datetime.now(timezone.utc)
+            processing_duration = (query_end_time - query_start_time).total_seconds()
+
+            rag_response_data = RAGResponse(
+                query_time_utc=query_start_time,
+                response_time_utc=query_end_time,
+                processing_duration_seconds=processing_duration,
+                original_query=original_query,
+                # condensed_query=condensed_query_text, # Removed
+                llm_model_used=LlamaSettings.llm.model if LlamaSettings.llm and hasattr(LlamaSettings.llm, 'model') else str(LlamaSettings.llm),
+                embedding_model_name_config=app_settings.embedding_model_name,
+                retriever_similarity_top_k_config=app_settings.retriever_similarity_top_k,
+                reranker_model_name_config=app_settings.reranker_model_name,
+                reranker_top_n_config=app_settings.reranker_top_n,
+                source_nodes_count_after_reranking=len(source_nodes) if source_nodes else 0,
+                source_nodes_details=source_node_details_for_rag,
+                final_answer_text=final_answer_text,
+                citations_generated=citations_generated
+            )
+
+            output_file_path = TMP_DIR / "latest_rag_response.json"
+            try:
+                with open(output_file_path, 'w', encoding='utf-8') as f:
+                    json.dump(rag_response_data.model_dump(mode='json'), f, indent=2, ensure_ascii=False)
+                logger.info(f"RAG response details saved to: {output_file_path}")
+            except Exception as e:
+                logger.error(f"Failed to write RAG response to JSON: {e}", exc_info=True)
+            return 
+        else: # Should not happen if initialize_chat_engine only returns RetrieverQueryEngine or None
+            logger.error(f"Engine is not a RetrieverQueryEngine. Type: {type(chat_engine)}. Cannot process.")
+            yield "Error: Chat engine is not correctly configured."
+            yield []
+            return
+
+        # Code for StreamingAgentChatResponse (CondensePlusContextChatEngine) is now effectively bypassed
+        # streaming_response: StreamingAgentChatResponse = chat_engine.stream_chat(query)
+        
+        # # Log the content of source nodes after reranking
+        # if hasattr(streaming_response, 'source_nodes') and streaming_response.source_nodes:
+        #     logger.info("--- CONTENT OF RERANKED SOURCE NODES ---")
+        #     for i, node_with_score in enumerate(streaming_response.source_nodes):
+        #         logger.info(f"Source Node {i+1} (Score: {node_with_score.score:.4f}):\n"
+        #                     f"  ID: {node_with_score.node.node_id}\n"
+        #                     f"  File: {node_with_score.node.metadata.get('file_path', 'N/A')}\n"
+        #                     f"  Page: {node_with_score.node.metadata.get('page_label', 'N/A')}\n"
+        #                     f"  First 200 chars: {node_with_score.node.get_content()[:200]}..."
+        #         )
+        #     logger.info("--- END CONTENT OF RERANKED SOURCE NODES ---")
+        # else:
+        #     logger.info("No source nodes found in streaming_response to log content.")
+
+        # Yield tokens from the generator
+        # if hasattr(streaming_response, 'response_gen'):
+        #     for token in streaming_response.response_gen:
+        #         yield token
+        # else:
+        #     logger.warning("Streaming response object does not have 'response_gen'.")
+        #     if hasattr(streaming_response, 'response') and streaming_response.response:
+        #          yield str(streaming_response.response) # Yield the whole response as one chunk
+        #     else:
+        #         yield "Error: Could not get a streamable or complete response."
+        #         # Early exit if no response parts can be obtained.
+        #         # Process source nodes even if response_gen is missing but source_nodes exist.
 
         # After all tokens, process source nodes for citations
-        citations = []
-        if hasattr(streaming_response, 'source_nodes') and streaming_response.source_nodes:
-            logger.info(f"Processing {len(streaming_response.source_nodes)} source nodes for citations.")
-            # Ensure LlamaSettings.llm is appropriate for title extraction (OpenAI compatible for .chat)
-            llm_for_titles = LlamaSettings.llm 
-            if not isinstance(llm_for_titles, LlamaIndexOpenAI):
-                 logger.warning(f"LlamaSettings.llm (type: {type(llm_for_titles)}) is not LlamaIndexOpenAI. Title extraction might fail or use fallback.")
-                 # Optionally, create a specific OpenAI instance here if LlamaSettings.llm is not suitable.
-                 # For now, we pass it and _get_title_for_chunk_from_llm will handle it or fallback.
-            citations = _create_document_citations(streaming_response.source_nodes, llm_for_titles)
-        else:
-            logger.info("No source nodes found in streaming response for citations.")
+        # citations = []
+        # if hasattr(streaming_response, 'source_nodes') and streaming_response.source_nodes:
+        #     logger.info("--- RERANKING CONFIRMATION ---")
+        #     logger.info(f"Initial retrieval configured for top_k={settings.retriever_similarity_top_k} candidates.")
+        #     logger.info(f"Reranker model='{settings.reranker_model_name}' configured for top_n={settings.reranker_top_n}.")
+        #     logger.info(f"After reranking, {len(streaming_response.source_nodes)} nodes remain for citation processing.")
+        #     logger.info("--- END RERANKING CONFIRMATION ---")
+        #     # Ensure LlamaSettings.llm is appropriate for title extraction (OpenAI compatible for .chat)
+        #     llm_for_titles = LlamaSettings.llm 
+        #     if not isinstance(llm_for_titles, LlamaIndexOpenAI):
+        #          logger.warning(f"LlamaSettings.llm (type: {type(llm_for_titles)}) is not LlamaIndexOpenAI. Title extraction might fail or use fallback.")
+        #          # Optionally, create a specific OpenAI instance here if LlamaSettings.llm is not suitable.
+        #          # For now, we pass it and _get_title_for_chunk_from_llm will handle it or fallback.
+        #     citations = _create_document_citations(streaming_response.source_nodes, llm_for_titles)
+        # else:
+        #     logger.info("No source nodes found in streaming response for citations.")
         
-        yield citations # Yield the list of citation objects
+        # yield citations # Yield the list of citation objects
 
     except Exception as e:
         logger.error(f"Error getting streaming chat response with citations: {e}", exc_info=True)
@@ -220,7 +430,7 @@ if __name__ == "__main__":
     from src.config import AppSettings
 
     logger.info("--- QA Service Test (Streaming with LLM Citations) --- ")
-    if not settings.openai_api_key or settings.openai_api_key == "your_openai_api_key_here_if_not_in_env":
+    if not app_settings.openai_api_key or app_settings.openai_api_key == "your_openai_api_key_here_if_not_in_env":
         logger.warning("OPENAI_API_KEY not found. Test might fail.")
         # exit(1)
     

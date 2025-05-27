@@ -26,7 +26,7 @@ class AppSettings(BaseSettings):
     max_tokens: int = 1024 # Increased for potentially more complex agent responses
 
     # Embedding Model Configuration
-    embedding_model_name: str = "BAAI/bge-small-en-v1.5"
+    embedding_model_name: str = "BAAI/bge-large-en-v1.5"
 
     # Vector Store Configuration
     vector_store_path: str = str(ROOT_DIR / "local_db" / "faiss_index")
@@ -38,8 +38,20 @@ class AppSettings(BaseSettings):
     chunk_size: int = 1000
     chunk_overlap: int = 100
 
+    # Retriever Configuration
+    retriever_similarity_top_k: int = 20  # Number of initial candidates to fetch by the dense retriever for fusion
+    bm25_similarity_top_k: int = 10 # Number of initial candidates for BM25 retriever before fusion
+
+    # Reranker Configuration
+    reranker_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    reranker_top_n: int = 5  # Number of candidates to keep after reranking
+
     # Logging Configuration (placeholder)
     log_level: str = "INFO"
+
+    # Chat Engine Configuration (examples, can be tuned)
+    chat_memory_token_limit: int = 3000
+    chat_engine_verbose: bool = True
 
 settings = AppSettings()
 

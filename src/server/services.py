@@ -94,7 +94,15 @@ async def stream_qa_responses(query: str) -> AsyncGenerator[Union[str, List[Docu
         while True:
             item = await queue.get()
             if item is None: # End of stream signal
+                logger.debug("stream_qa_responses: Received None from queue, breaking.")
                 break
+            # Log the item being yielded to the FastAPI StreamingResponse
+            if isinstance(item, str):
+                logger.debug(f"stream_qa_responses: Yielding token: '{item[:30]}...'") # Log part of token
+            elif isinstance(item, list):
+                logger.debug(f"stream_qa_responses: Yielding citations list (count: {len(item)})")
+            else:
+                logger.debug(f"stream_qa_responses: Yielding item of type {type(item)}")
             yield item # Yields strings (tokens) or List[DocumentCitation]
             queue.task_done() # Signal that the item has been processed
         
