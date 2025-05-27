@@ -5,6 +5,7 @@ import os
 from typing import List, Optional
 from pathlib import Path
 import shutil
+import pickle # Re-adding for BM25 persistence
 
 from llama_index.core import Document, Settings as LlamaSettings, VectorStoreIndex, StorageContext
 from llama_index.core.embeddings import resolve_embed_model
@@ -13,6 +14,8 @@ from llama_index.vector_stores.faiss import FaissVectorStore
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding # Import for type checking
 from llama_index.retrievers.bm25 import BM25Retriever # Added for BM25
 import faiss
+
+from rank_bm25 import BM25Okapi # For type hinting the pickled object
 
 # Corrected imports
 from config import settings as initial_settings_from_config, AppSettings
@@ -134,8 +137,30 @@ def create_and_persist_index(documents: List[Document], vector_store_path_str: s
         # at the root, which might be the source of the UnicodeDecodeError if it gets corrupted.
         logger.info(f"Successfully persisted docstore and index_store to: {vector_store_path}")
 
-        # BM25Retriever will be created on-the-fly in qa_service from the persisted docstore.
-        # No direct persistence for BM25Retriever object itself here.
+        # --- BM25 Persistence (Pickling Attempt 2) --- 
+        logger.info("Attempting to create and persist BM25 engine via pickling...")
+        all_nodes_for_bm25 = list(storage_context.docstore.docs.values())
+        if all_nodes_for_bm25:
+            try:
+                # Create a temporary BM25Retriever to build the BM25 engine
+                temp_bm25_retriever = BM25Retriever.from_defaults(nodes=all_nodes_for_bm25, tokenizer=None)
+                
+                # Try to access the underlying rank_bm25 object via .bm25 (direct attribute)
+                bm25_engine_to_persist = temp_bm25_retriever.bm25 
+                
+                bm25_engine_path = vector_store_path / "bm25_engine.pkl"
+                with open(bm25_engine_path, "wb") as f:
+                    pickle.dump(bm25_engine_to_persist, f)
+                logger.info(f"Successfully persisted BM25 engine to: {bm25_engine_path}")
+            except AttributeError as ae:
+                logger.error(f"AttributeError accessing BM25 engine (tried .bm25): {ae}. BM25 will not be persisted.", exc_info=True)
+            except Exception as e_bm25_persist:
+                logger.error(f"Error during BM25 engine pickling: {e_bm25_persist}. BM25 will not be persisted.", exc_info=True)
+        else:
+            logger.warning("No nodes found in docstore for BM25 engine creation.")
+        # --- End BM25 Persistence ---
+
+        logger.info("BM25 engine (if created and pickled) saved. It will be loaded or created on-the-fly in qa_service.")
 
         return True
 

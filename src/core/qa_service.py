@@ -6,24 +6,21 @@ from pathlib import Path
 from datetime import datetime, timezone
 import json
 import math # Added for sigmoid function
+import pickle # Re-adding for BM25 persistence
 
 # LlamaIndex imports
-from llama_index.core import VectorStoreIndex, Settings as LlamaSettings
-from llama_index.core.chat_engine.types import BaseChatEngine, StreamingAgentChatResponse
+from llama_index.core import  Settings as LlamaSettings
+from llama_index.core.chat_engine.types import BaseChatEngine
 from llama_index.core.schema import NodeWithScore
 from llama_index.llms.openai import OpenAI as LlamaIndexOpenAI
 from llama_index.core.llms import ChatMessage, MessageRole
 from llama_index.core.postprocessor import SentenceTransformerRerank
 from llama_index.core.query_engine import RetrieverQueryEngine
-from llama_index.core.chat_engine import CondensePlusContextChatEngine
 from llama_index.core.callbacks import LlamaDebugHandler, CallbackManager
 from llama_index.core import get_response_synthesizer
 from llama_index.retrievers.bm25 import BM25Retriever
 from llama_index.core.retrievers import QueryFusionRetriever
-
-# LangChain imports for memory (though LlamaIndex chat engine can manage its own)
-# from langchain.memory import ConversationBufferMemory # Option 1: LangChain memory
-from llama_index.core.memory import ChatMemoryBuffer
+from rank_bm25 import BM25Okapi # For type hinting the loaded object
 
 # Configuration and utility imports (using src. prefix as per your current setup)
 from src.config import settings as app_settings
@@ -95,25 +92,53 @@ def initialize_chat_engine() -> BaseChatEngine | None:
     logger.info(f"Vector retriever created with similarity_top_k={app_settings.retriever_similarity_top_k}.")
 
     # 1.b Create BM25 sparse retriever on-the-fly from the loaded docstore
-    try:
-        all_nodes = list(storage_context.docstore.docs.values()) 
-        if not all_nodes:
-            logger.error("Docstore is empty, cannot initialize BM25Retriever.")
-            return None
-        
-        # TODO: For larger datasets, creating BM25Retriever on-the-fly at each QA service init can be slow.
-        # Investigate persisting the BM25 model/index during the main indexing pipeline (src/core/indexing_service.py).
-        # This might involve pickling the internal rank_bm25 object or checking for new persistence methods
-        # in future versions of llama-index-retrievers-bm25, as the direct .persist() method was not found.
-        logger.info(f"Creating BM25Retriever on-the-fly from {len(all_nodes)} nodes (similarity_top_k={app_settings.bm25_similarity_top_k})...")
-        bm25_retriever = BM25Retriever.from_defaults(
-            nodes=all_nodes,
-            similarity_top_k=app_settings.bm25_similarity_top_k
-        )
-        logger.info(f"BM25Retriever created successfully on-the-fly.")
+    logger.info("Initializing BM25Retriever...")
+    all_nodes_from_docstore = list(storage_context.docstore.docs.values())
+    if not all_nodes_from_docstore:
+        logger.error("Docstore is empty, cannot initialize BM25Retriever.")
+        return None
 
-    except Exception as e:
-        logger.error(f"Failed to create BM25Retriever on-the-fly: {e}", exc_info=True)
+    bm25_retriever: Optional[BM25Retriever] = None
+    bm25_engine_path = Path(app_settings.vector_store_path) / "bm25_engine.pkl"
+    
+    if bm25_engine_path.exists():
+        logger.info(f"Found persisted BM25 engine at: {bm25_engine_path}. Attempting to load.")
+        try:
+            with open(bm25_engine_path, "rb") as f:
+                loaded_bm25_engine = pickle.load(f)
+            
+            # We expect loaded_bm25_engine to be a BM25Okapi (or similar rank_bm25) instance.
+            # We need to check its type if we want to be very specific, but often direct assignment works if the pickled object is correct.
+            if loaded_bm25_engine: # Basic check that something was loaded
+                bm25_retriever = BM25Retriever.from_defaults(
+                    nodes=all_nodes_from_docstore, 
+                    similarity_top_k=app_settings.bm25_similarity_top_k,
+                    tokenizer=None 
+                )
+                bm25_retriever.bm25 = loaded_bm25_engine # Assign loaded engine to .bm25
+                logger.info("Successfully loaded and configured BM25Retriever with persisted BM25 engine (using .bm25).")
+            else:
+                logger.warning(f"Loaded object from {bm25_engine_path} was None or empty. Falling back to on-the-fly creation.")
+                bm25_retriever = None # Ensure fallback
+        except Exception as e_bm25_load:
+            logger.error(f"Error loading persisted BM25 engine from {bm25_engine_path}: {e_bm25_load}. Falling back to on-the-fly creation.", exc_info=True)
+            bm25_retriever = None # Ensure fallback
+
+    if bm25_retriever is None:
+        logger.info("Persisted BM25 engine not loaded/found. Creating BM25Retriever on-the-fly...")
+        try:
+            bm25_retriever = BM25Retriever.from_defaults(
+                nodes=all_nodes_from_docstore,
+                similarity_top_k=app_settings.bm25_similarity_top_k,
+                tokenizer=None
+            )
+            logger.info(f"BM25Retriever created successfully on-the-fly from {len(all_nodes_from_docstore)} nodes.")
+        except Exception as e_bm25_create:
+            logger.error(f"Failed to create BM25Retriever on-the-fly: {e_bm25_create}", exc_info=True)
+            return None
+    
+    if bm25_retriever is None:
+        logger.error("BM25Retriever could not be initialized by any method.")
         return None
 
     # 1.c Create a QueryFusionRetriever for hybrid search
@@ -275,6 +300,48 @@ def stream_chat_response(query: str, chat_engine: BaseChatEngine) -> Generator[U
             
             final_answer_text = "".join(full_response_text_parts)
 
+            # --- Observe raw BM25 results (for logging/debug) ---
+            bm25_raw_snippets_for_log: Optional[List[str]] = None
+            # Attempt to get the bm25_retriever from the hybrid retriever
+            if isinstance(chat_engine.retriever, QueryFusionRetriever):
+                actual_bm25_retriever = None
+                # Try accessing via _retrievers (common private attribute name)
+                if hasattr(chat_engine.retriever, '_retrievers'):
+                    for r in chat_engine.retriever._retrievers:
+                        if isinstance(r, BM25Retriever):
+                            actual_bm25_retriever = r
+                            break
+                else:
+                    logger.warning("QA_SERVICE: QueryFusionRetriever does not have '_retrievers' attribute.")
+                
+                if actual_bm25_retriever:
+                    logger.info("QA_SERVICE: Retrieving raw BM25 results for observability...")
+                    try:
+                        # Retrieve top N (e.g., 3) raw results from BM25
+                        # Use a different similarity_top_k for this observability query if needed,
+                        # or rely on its configured one.
+                        # For simplicity, let's assume its default similarity_top_k is reasonable for a peek.
+                        # To be more explicit, we could set it: actual_bm25_retriever.similarity_top_k = 3
+                        raw_bm25_nodes = actual_bm25_retriever.retrieve(original_query)
+                        if raw_bm25_nodes:
+                            bm25_raw_snippets_for_log = []
+                            logger.info(f"QA_SERVICE: Raw BM25 nodes found: {len(raw_bm25_nodes)}")
+                            for i, node_ws in enumerate(raw_bm25_nodes[:3]): # Log top 3 snippets
+                                # Include full content for the snippet in the JSON
+                                snippet = f"BM25 Raw {i+1} (Score: {node_ws.score:.4f}): {node_ws.node.get_content()}" 
+                                bm25_raw_snippets_for_log.append(snippet)
+                                # For console logging, still truncate to avoid flooding the console
+                                logger.info(f"  Snippet for RAGResponse (console log truncated): BM25 Raw {i+1} (Score: {node_ws.score:.4f}): {node_ws.node.get_content()[:200]}...") 
+                        else:
+                            logger.info("QA_SERVICE: No raw results from BM25 retriever for this query.")
+                    except Exception as e_bm25_raw:
+                        logger.error(f"QA_SERVICE: Error retrieving raw BM25 results: {e_bm25_raw}", exc_info=True)
+                else:
+                    logger.warning("QA_SERVICE: BM25Retriever not found within the QueryFusionRetriever.")
+            else:
+                logger.warning("QA_SERVICE: Chat engine's retriever is not a QueryFusionRetriever. Cannot get raw BM25 results.")
+            # --- End Observe raw BM25 results ---
+
             # Log and process source nodes after streaming is complete (or response is obtained)
             source_nodes = response.source_nodes
             source_node_details_for_rag: List[RAGSourceNodeDetail] = []
@@ -337,7 +404,6 @@ def stream_chat_response(query: str, chat_engine: BaseChatEngine) -> Generator[U
                 response_time_utc=query_end_time,
                 processing_duration_seconds=processing_duration,
                 original_query=original_query,
-                # condensed_query=condensed_query_text, # Removed
                 llm_model_used=LlamaSettings.llm.model if LlamaSettings.llm and hasattr(LlamaSettings.llm, 'model') else str(LlamaSettings.llm),
                 embedding_model_name_config=app_settings.embedding_model_name,
                 retriever_similarity_top_k_config=app_settings.retriever_similarity_top_k,
@@ -346,7 +412,8 @@ def stream_chat_response(query: str, chat_engine: BaseChatEngine) -> Generator[U
                 source_nodes_count_after_reranking=len(source_nodes) if source_nodes else 0,
                 source_nodes_details=source_node_details_for_rag,
                 final_answer_text=final_answer_text,
-                citations_generated=citations_generated
+                citations_generated=citations_generated,
+                bm25_raw_retrieved_snippets=bm25_raw_snippets_for_log
             )
 
             output_file_path = TMP_DIR / "latest_rag_response.json"

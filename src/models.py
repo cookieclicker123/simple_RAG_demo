@@ -59,4 +59,5 @@ class RAGResponse(BaseModel):
     source_nodes_details: List[RAGSourceNodeDetail] = Field(description="Details of the source nodes used for the response, after reranking")
     
     final_answer_text: str = Field(description="The complete text of the generated answer")
-    citations_generated: List[DocumentCitation] = Field(description="List of document citations generated for the answer") 
+    citations_generated: List[DocumentCitation] = Field(description="List of document citations generated for the answer")
+    bm25_raw_retrieved_snippets: Optional[List[str]] = Field(None, description="Snippets from top N raw BM25 results before fusion/reranking, for observability.") 
