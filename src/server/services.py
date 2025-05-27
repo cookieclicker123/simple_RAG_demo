@@ -18,97 +18,107 @@ logger = logging.getLogger(__name__)
 _chat_engine_instance: BaseChatEngine | None = None
 _chat_engine_lock = asyncio.Lock() # To prevent race conditions during initialization
 
+async def initialize_global_chat_engine():
+    """Initializes the global chat engine instance. To be called at application startup."""
+    global _chat_engine_instance
+    async with _chat_engine_lock:
+        if _chat_engine_instance is None:
+            logger.info("Lifespan: Initializing global chat engine for FastAPI service at startup...")
+            active_app_settings = get_active_settings()
+            # Configure LlamaIndex globals. This is synchronous.
+            # Running synchronous I/O bound task in a separate thread is good practice if it were slow, 
+            # but configure_llama_index_globals is likely CPU-bound and fast.
+            # For lifespan, it might be okay to run it directly if it's quick, or use to_thread.
+            await asyncio.to_thread(configure_llama_index_globals, active_app_settings)
+            logger.info(f"Lifespan: LlamaSettings.llm: {LlamaSettings.llm.model if LlamaSettings.llm and hasattr(LlamaSettings.llm, 'model') else LlamaSettings.llm}")
+            logger.info(f"Lifespan: LlamaSettings.embed_model: {LlamaSettings.embed_model}")
+
+            # sync_initialize_chat_engine can be blocking (loads models, index)
+            _chat_engine_instance = await asyncio.to_thread(sync_initialize_chat_engine)
+            if _chat_engine_instance:
+                logger.info("Lifespan: Global chat engine initialized successfully.")
+            else:
+                logger.error("Lifespan: Failed to initialize global chat engine.")
+        else:
+            logger.info("Lifespan: Global chat engine already initialized.")
+
+async def shutdown_global_chat_engine():
+    """Placeholder for shutting down/releasing resources from the global chat engine."""
+    global _chat_engine_instance
+    logger.info("Lifespan: Shutting down global chat engine...")
+    if _chat_engine_instance is not None:
+        # For most LlamaIndex engines, there isn't an explicit close().
+        # Deleting the reference can help with garbage collection.
+        # If specific components had close methods (e.g., a db connection), call them here.
+        del _chat_engine_instance
+        _chat_engine_instance = None
+        logger.info("Lifespan: Global chat engine instance released.")
+    else:
+        logger.info("Lifespan: Global chat engine was not initialized.")
+
 async def get_chat_engine() -> BaseChatEngine | None:
     """
-    Initializes and returns the chat engine.
-    Uses a lock to prevent multiple initializations if called concurrently.
+    Returns the globally initialized chat engine.
+    Relies on the startup event to have initialized the engine.
     """
-    global _chat_engine_instance
     if _chat_engine_instance is None:
-        async with _chat_engine_lock:
-            if _chat_engine_instance is None: # Double check after acquiring lock
-                logger.info("No active chat engine session. Initializing for FastAPI service...")
-                # Ensure LlamaIndex globals are configured
-                active_app_settings = get_active_settings()
-                # This needs to be synchronous as configure_llama_index_globals is sync
-                # and LlamaSettings are global.
-                # Running synchronous I/O bound task in a separate thread
-                await asyncio.to_thread(configure_llama_index_globals, active_app_settings)
-
-                logger.info(f"FastAPI service using LLM (from LlamaSettings): {LlamaSettings.llm.model if LlamaSettings.llm and hasattr(LlamaSettings.llm, 'model') else LlamaSettings.llm}")
-                logger.info(f"FastAPI service using Embedding Model (from LlamaSettings): {LlamaSettings.embed_model}")
-
-                # sync_initialize_chat_engine can be blocking (loads models, index)
-                # Run it in a thread pool to avoid blocking the event loop
-                _chat_engine_instance = await asyncio.to_thread(sync_initialize_chat_engine)
-                if _chat_engine_instance:
-                    logger.info("Chat engine initialized successfully for FastAPI service.")
-                else:
-                    logger.error("Failed to initialize chat engine for FastAPI service.")
+        logger.warning("get_chat_engine called but global engine is not initialized. This might happen if accessed before startup or after shutdown.")
+        # Optionally, could try to initialize it here as a fallback, but ideally startup handles it.
+        # await initialize_global_chat_engine() # Fallback initialization, uncomment if needed but makes lifespan less distinct
     return _chat_engine_instance
 
 async def stream_qa_responses(query: str) -> AsyncGenerator[Union[str, List[DocumentCitation]], None]:
     """
-    Asynchronously streams responses from the QA service.
+    Asynchronously streams responses from the QA service using the global engine.
     """
     chat_engine = await get_chat_engine()
     if not chat_engine:
-        # Yield a string error token first, then an empty list for citations
-        yield "Error: Chat engine not initialized."
+        yield "Error: Chat engine not available. It may not have initialized correctly at startup."
         yield [] 
         return
 
     logger.info(f"Streaming QA response for query: {query}")
     try:
-        # sync_stream_chat_response now yields strings (tokens) and then a List[DocumentCitation]
-        # We'll run the synchronous generator in a separate thread
-        # and yield items back to the async generator.
-        
-        # Create a queue to pass data from the sync thread to the async generator
         queue = asyncio.Queue()
-
-        # Get the current running event loop in the main async context
         main_event_loop = asyncio.get_running_loop()
 
         def run_sync_generator_in_thread(loop: asyncio.AbstractEventLoop):
             try:
-                for item in sync_stream_chat_response(query, chat_engine):
-                    # Schedule queue.put in the main event loop
+                logger.info(f"SERVICES.PY: run_sync_generator_in_thread starting for query: {query}")
+                for item_count, item in enumerate(sync_stream_chat_response(query, chat_engine)):
+                    logger.info(f"SERVICES.PY: run_sync_generator_in_thread received item #{item_count} from qa_service: '{str(item)[:100]}...'")
                     asyncio.run_coroutine_threadsafe(queue.put(item), loop).result()
-                # Signal completion of all items (tokens + citations list)
-                asyncio.run_coroutine_threadsafe(queue.put(None), loop).result() # End of stream signal
+                logger.info(f"SERVICES.PY: run_sync_generator_in_thread loop FINISHED for query: {query}. Sending None to queue.")
+                asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
             except Exception as e:
                 logger.error(f"Error in sync_stream_chat_response thread: {e}", exc_info=True)
-                # Send error token, then empty citation list, then end signal
                 asyncio.run_coroutine_threadsafe(queue.put(f"Error during streaming: {e}"), loop).result()
-                asyncio.run_coroutine_threadsafe(queue.put([]), loop).result() # Empty citations on error
+                asyncio.run_coroutine_threadsafe(queue.put([]), loop).result()
                 asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
 
-        # Start the synchronous generator in a separate thread
         import threading
-        # Pass the main event loop to the thread function
         thread = threading.Thread(target=run_sync_generator_in_thread, args=(main_event_loop,))
         thread.start()
 
-        # Consume from the queue in the async generator
         while True:
             item = await queue.get()
-            if item is None: # End of stream signal
+            if item is None:
                 logger.debug("stream_qa_responses: Received None from queue, breaking.")
                 break
-            # Log the item being yielded to the FastAPI StreamingResponse
             if isinstance(item, str):
-                logger.debug(f"stream_qa_responses: Yielding token: '{item[:30]}...'") # Log part of token
+                logger.debug(f"stream_qa_responses: Yielding token: '{item[:30]}...'")
             elif isinstance(item, list):
                 logger.debug(f"stream_qa_responses: Yielding citations list (count: {len(item)})")
             else:
                 logger.debug(f"stream_qa_responses: Yielding item of type {type(item)}")
-            yield item # Yields strings (tokens) or List[DocumentCitation]
-            queue.task_done() # Signal that the item has been processed
+            yield item
+            queue.task_done()
         
-        thread.join() # Ensure the thread finishes
+        logger.debug(f"stream_qa_responses: Exited queue consumption loop for query '{query}'.")
+        thread.join()
+        logger.debug(f"stream_qa_responses: Thread joined for query '{query}'. Async generator finishing.")
 
     except Exception as e:
         logger.error(f"Error in stream_qa_responses: {e}", exc_info=True)
         yield f"Sorry, an error occurred: {e}"
-        yield [] # Yield empty list for citations in case of error 
+        yield [] 

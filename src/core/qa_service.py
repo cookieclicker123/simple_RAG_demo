@@ -77,8 +77,8 @@ def initialize_chat_engine() -> BaseChatEngine | None:
     logger.info("Initializing chat engine with reranking and hybrid search...")
 
     # Setup LlamaDebugHandler for detailed logging
-    llama_debug_handler = LlamaDebugHandler(print_trace_on_end=True)
-    logger.info(f"LlamaDebugHandler activated. Detailed LlamaIndex logs will be printed.") # This was for global, now local to engine
+    llama_debug_handler = LlamaDebugHandler(print_trace_on_end=False)
+    logger.info(f"LlamaDebugHandler activated. Detailed LlamaIndex logs will NOT auto-print on end.")
 
     logger.info(f"Loading vector index and storage context from: {app_settings.vector_store_path}")
     vector_index, storage_context = load_faiss_index_from_storage(
@@ -356,6 +356,10 @@ def stream_chat_response(query: str, chat_engine: BaseChatEngine) -> Generator[U
                 logger.info(f"RAG response details saved to: {output_file_path}")
             except Exception as e:
                 logger.error(f"Failed to write RAG response to JSON: {e}", exc_info=True)
+            
+            logger.info("QA_SERVICE: stream_chat_response is ABOUT TO YIELD FINAL SENTINEL BEFORE RETURN")
+            yield "QA_SERVICE_STREAM_ENDED_SENTINEL"
+            logger.info("QA_SERVICE: stream_chat_response is ABOUT TO RETURN")
             return 
         else: # Should not happen if initialize_chat_engine only returns RetrieverQueryEngine or None
             logger.error(f"Engine is not a RetrieverQueryEngine. Type: {type(chat_engine)}. Cannot process.")
