@@ -26,6 +26,7 @@ from rank_bm25 import BM25Okapi # For type hinting the loaded object
 from src.config import settings as app_settings
 from src.utils.vector_store_handlers import load_faiss_index_from_storage
 from src.models import DocumentCitation, RAGResponse, RAGSourceNodeDetail
+from src.prompts.investor_prompt import INVESTOR_SYSTEM_PROMPT # Added import
 
 logger = logging.getLogger(__name__)
 # logging.basicConfig(level=settings.log_level) # BasicConfig should ideally be called once
@@ -60,13 +61,19 @@ if llm_needs_configuration:
             model=current_llm_model_in_settings,
             temperature=app_settings.temperature,
             api_key=app_settings.openai_api_key,
-            max_tokens=app_settings.max_tokens
+            max_tokens=app_settings.max_tokens,
+            system_prompt=INVESTOR_SYSTEM_PROMPT
         )
     except Exception as e:
         logger.error(f"Failed to configure LlamaSettings.llm with {current_llm_model_in_settings}: {e}", exc_info=True)
         if not LlamaSettings.llm:
             logger.warning("Falling back to a default gpt-3.5-turbo due to configuration error during specific setup.")
-            LlamaSettings.llm = LlamaIndexOpenAI(model="gpt-3.5-turbo", temperature=app_settings.temperature, api_key=app_settings.openai_api_key)
+            LlamaSettings.llm = LlamaIndexOpenAI(
+                model="gpt-3.5-turbo", 
+                temperature=app_settings.temperature, 
+                api_key=app_settings.openai_api_key,
+                system_prompt=INVESTOR_SYSTEM_PROMPT
+            )
         # If LlamaSettings.llm was already set to something else before this specific configuration attempt and failed,
         # it would retain its previous value. This block ensures a fallback ONLY if it's None after the try-except.
 
@@ -137,9 +144,6 @@ def initialize_chat_engine() -> BaseChatEngine | None:
             logger.error(f"Failed to create BM25Retriever on-the-fly: {e_bm25_create}", exc_info=True)
             return None
     
-    if bm25_retriever is None:
-        logger.error("BM25Retriever could not be initialized by any method.")
-        return None
 
     # 1.c Create a QueryFusionRetriever for hybrid search
     # The QueryFusionRetriever will combine results before they go to the reranker.
@@ -520,7 +524,8 @@ if __name__ == "__main__":
             model=_test_settings.llm_model_name,
             temperature=_test_settings.temperature,
             api_key=_test_settings.openai_api_key,
-            max_tokens=_test_settings.max_tokens
+            max_tokens=_test_settings.max_tokens,
+            system_prompt=INVESTOR_SYSTEM_PROMPT
         )
 
     logger.info(f"Test - LlamaSettings.llm for QA: {LlamaSettings.llm.model if LlamaSettings.llm else 'None'}")
