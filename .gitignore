@@ -58,3 +58,6 @@ htmlcov/
 
 data2
 data
+
+# Temporary files for RAG output
+tmp/

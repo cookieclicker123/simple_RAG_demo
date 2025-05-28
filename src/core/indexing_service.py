@@ -5,13 +5,17 @@ import os
 from typing import List, Optional
 from pathlib import Path
 import shutil
+import pickle # Re-adding for BM25 persistence
 
-from llama_index.core import Document, Settings as LlamaSettings, VectorStoreIndex
+from llama_index.core import Document, Settings as LlamaSettings, VectorStoreIndex, StorageContext
 from llama_index.core.embeddings import resolve_embed_model
 # from llama_index.core.node_parser import SentenceSplitter # Not explicitly used if relying on LlamaSettings
 from llama_index.vector_stores.faiss import FaissVectorStore
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding # Import for type checking
+from llama_index.retrievers.bm25 import BM25Retriever # Added for BM25
 import faiss
+
+from rank_bm25 import BM25Okapi # For type hinting the pickled object
 
 # Corrected imports
 from config import settings as initial_settings_from_config, AppSettings
@@ -87,24 +91,77 @@ def create_and_persist_index(documents: List[Document], vector_store_path_str: s
         logger.info(f"Resolved embedding dimension: {embed_dim}")
         
         faiss_index_instance = faiss.IndexFlatL2(embed_dim)
-        vector_store = FaissVectorStore(faiss_index=faiss_index_instance)
+        vector_store_path = Path(vector_store_path_str)
+        
+        # Define the path for the FaissVectorStore components (binary and its JSON metadata)
+        faiss_component_dir = vector_store_path / "vector_store"
+        faiss_component_dir.mkdir(parents=True, exist_ok=True)
+        faiss_binary_persist_path = faiss_component_dir / "default__vector_store.faiss"
+        
+        # Create FaissVectorStore instance
+        fvs = FaissVectorStore(faiss_index=faiss_index_instance)
 
-        index = VectorStoreIndex.from_documents(
-            documents,
-            vector_store=vector_store, # Uses the FAISS vector store
-            # transformations are implicitly handled by LlamaSettings.chunk_size/overlap if not overridden here
+        # Create a new StorageContext for this indexing operation
+        # This will hold the docstore, vector_store, and index_store.
+        storage_context = StorageContext.from_defaults(
+            vector_store=fvs # Pass the FaissVectorStore instance
         )
 
-        logger.info(f"Successfully created vector index in memory.")
+        # The VectorStoreIndex will use the docstore from this storage_context to store nodes.
+        index = VectorStoreIndex.from_documents(
+            documents,
+            storage_context=storage_context, 
+            # transformations are implicitly handled by LlamaSettings.chunk_size/overlap if not overridden here
+        )
+        logger.info(f"Successfully created vector index in memory. Index ID: {index.index_id}")
         
-        # Persist the vector store to the specified directory path
-        vector_store_path = Path(vector_store_path_str)
+        # Ensure the main persist directory exists
         if not vector_store_path.exists():
             vector_store_path.mkdir(parents=True, exist_ok=True)
             logger.info(f"Created vector store directory: {vector_store_path}")
 
-        index.storage_context.persist(persist_dir=str(vector_store_path))
-        logger.info(f"Successfully persisted index to: {vector_store_path}")
+        # 1. Explicitly persist the FaissVectorStore to its subdirectory
+        # This will create default__vector_store.faiss and default__vector_store.json in the faiss_component_dir.
+        fvs.persist(persist_path=str(faiss_binary_persist_path)) # LlamaIndex handles naming for .json
+        logger.info(f"Explicitly persisted FaissVectorStore components to: {faiss_component_dir}")
+
+        # 2. Persist the rest of the storage_context (docstore, index_store) to the main directory.
+        #    The vector_store metadata in the root (default__vector_store.json created by this call)
+        #    might be problematic if it conflicts with the one in the subdirectory.
+        #    Let's try persisting specific components instead of the whole context again,
+        #    or ensure the loader prioritizes the one in the subdirectory.
+        #    For now, our loader explicitly loads the FAISS binary and then uses the root docstore/indexstore.
+        storage_context.docstore.persist(persist_path=str(vector_store_path / "docstore.json"))
+        storage_context.index_store.persist(persist_path=str(vector_store_path / "index_store.json"))
+        # We do NOT call storage_context.persist() here to avoid it writing its own default__vector_store.json
+        # at the root, which might be the source of the UnicodeDecodeError if it gets corrupted.
+        logger.info(f"Successfully persisted docstore and index_store to: {vector_store_path}")
+
+        # --- BM25 Persistence (Pickling Attempt 2) --- 
+        logger.info("Attempting to create and persist BM25 engine via pickling...")
+        all_nodes_for_bm25 = list(storage_context.docstore.docs.values())
+        if all_nodes_for_bm25:
+            try:
+                # Create a temporary BM25Retriever to build the BM25 engine
+                temp_bm25_retriever = BM25Retriever.from_defaults(nodes=all_nodes_for_bm25, tokenizer=None)
+                
+                # Try to access the underlying rank_bm25 object via .bm25 (direct attribute)
+                bm25_engine_to_persist = temp_bm25_retriever.bm25 
+                
+                bm25_engine_path = vector_store_path / "bm25_engine.pkl"
+                with open(bm25_engine_path, "wb") as f:
+                    pickle.dump(bm25_engine_to_persist, f)
+                logger.info(f"Successfully persisted BM25 engine to: {bm25_engine_path}")
+            except AttributeError as ae:
+                logger.error(f"AttributeError accessing BM25 engine (tried .bm25): {ae}. BM25 will not be persisted.", exc_info=True)
+            except Exception as e_bm25_persist:
+                logger.error(f"Error during BM25 engine pickling: {e_bm25_persist}. BM25 will not be persisted.", exc_info=True)
+        else:
+            logger.warning("No nodes found in docstore for BM25 engine creation.")
+        # --- End BM25 Persistence ---
+
+        logger.info("BM25 engine (if created and pickled) saved. It will be loaded or created on-the-fly in qa_service.")
+
         return True
 
     except Exception as e:
