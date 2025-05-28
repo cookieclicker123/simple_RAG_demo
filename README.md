@@ -18,62 +18,6 @@ For a detailed plan of the agent-based system we are evolving towards, please se
 *   **Configuration**: `Pydantic-Settings` (from `.env` files)
 *   **Environment & Package Management**: `uv`
 
-## Project Structure
-
-The project follows a structured layout to promote modularity and maintainability:
-
-```
-simple_RAG_demo/
-├── .venv/                               # Virtual environment (managed by uv)
-├── data/                                # Directory for user's input documents (e.g., PDFs)
-├── local_db/                            # Directory for storing the FAISS vector index
-├── .env                                 # Local environment variables (Create from .env.example)
-├── .env.example                         # Example environment variables file
-├── .gitignore                           # Specifies intentionally untracked files
-├── pyproject.toml                       # Project metadata and dependencies (PEP 621)
-├── README.md                            # This file
-├── spec.txt                             # Detailed project specification for the agent system
-├── src/                                 # Source code
-│   ├── __init__.py                      # Makes src a package (simple_rag_pipeline)
-│   ├── models.py                        # Pydantic data models
-│   ├── config.py                        # Configuration (API keys, paths, model names)
-│   ├── core/                            # Core business logic
-│   │   ├── __init__.py
-│   │   ├── indexing_service.py          # Document parsing, chunking, embedding, storing
-│   │   └── qa_service.py                # Conversational QA, memory, LLM interaction
-│   ├── utils/                           # Utility functions
-│   │   ├── __init__.py
-│   │   └── file_handlers.py             # Document loading, preprocessing
-│   │   └── vector_store_handlers.py     # Vector store creation, loading, saving
-│   ├── agents/                            # Agent-related code (ADK based)
-│   │   ├── __init__.py
-│   │   ├── meta_agent.py                # Orchestrator Meta-Agent
-│   │   ├── sub_agents/                  # Specialized sub-agents
-│   │   │   ├── __init__.py
-│   │   │   ├── rag_agent.py             # RAG sub-agent
-│   │   │   ├── search_planner_agent.py  # Sub-agent for planning web searches
-│   │   │   └── web_search_agent.py      # Web searching sub-agent
-│   │   └── tools/                       # Custom ADK tools
-│   │       ├── __init__.py
-│   │       └── rag_tool.py              # ADK tool wrapping the RAG pipeline
-│   ├── app/                             # Application entry points (CLIs)
-│   │   ├── __init__.py
-│   │   ├── indexer_cli.py               # CLI script for indexing documents
-│   │   ├── chat_cli.py                  # CLI script for RAG QA chat interface
-│   │   └── agent_cli.py                 # CLI for interacting with the Meta-Agent
-└── tests/                               # Test suite
-    ├── __init__.py
-    ├── fixtures/                        # Test fixtures
-    │   ├── __init__.py
-    │   └── .gitkeep
-    ├── unit/                            # Unit tests
-    │   ├── __init__.py
-    │   └── .gitkeep
-    └── integration/                     # Integration tests
-        ├── __init__.py
-        └── .gitkeep                     # Added .gitkeep for integration tests
-```
-
 ## Setup
 
 This project uses `uv` for package and environment management.
