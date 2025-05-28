@@ -18,8 +18,8 @@ import faiss
 from rank_bm25 import BM25Okapi # For type hinting the pickled object
 
 # Corrected imports
-from config import settings as initial_settings_from_config, AppSettings
-from utils.file_handlers import load_documents_from_directory
+from src.config import settings as initial_settings_from_config, AppSettings
+from src.utils.file_handlers import load_documents_from_directory
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=initial_settings_from_config.log_level)
@@ -63,13 +63,31 @@ configure_llama_index_globals(get_active_settings())
 def get_embedding_dimension(embed_model: HuggingFaceEmbedding) -> int:
     """Safely retrieves the embedding dimension from a HuggingFaceEmbedding model."""
     if hasattr(embed_model, '_model') and hasattr(embed_model._model, 'get_sentence_embedding_dimension'):
-        return embed_model._model.get_sentence_embedding_dimension()
-    elif hasattr(embed_model, 'dimensions'): # Some embedding models might have a 'dimensions' attr
+        dimension = embed_model._model.get_sentence_embedding_dimension()
+        logger.info(f"Dynamically determined embedding dimension: {dimension} from embed_model._model.get_sentence_embedding_dimension()")
+        return dimension
+    elif hasattr(embed_model, 'dimensions') and embed_model.dimensions is not None:
+        logger.info(f"Dynamically determined embedding dimension: {embed_model.dimensions} from embed_model.dimensions")
         return embed_model.dimensions
-    # Fallback or raise error if dimension cannot be determined
-    # For BAAI/bge-small-en-v1.5, it's 384. This could be a config fallback.
-    logger.warning("Could not dynamically determine embedding dimension. Falling back to default 384 for BAAI/bge-small-en-v1.5. This might be incorrect for other models.")
-    return 384
+    
+    # Fallback if dynamic detection fails - specific to current primary model
+    # BAAI/bge-large-en-v1.5 has 1024 dimensions.
+    # This should ideally be tied to the model name in config or be more robust.
+    current_model_name = initial_settings_from_config.embedding_model_name # Or LlamaSettings.embed_model.model_name if available and reliable
+    if "bge-large" in current_model_name.lower():
+        logger.warning(f"Could not dynamically determine embedding dimension for {current_model_name}. Falling back to 1024 (common for bge-large models).")
+        return 1024
+    elif "bge-base" in current_model_name.lower():
+        logger.warning(f"Could not dynamically determine embedding dimension for {current_model_name}. Falling back to 768 (common for bge-base models).")
+        return 768
+    elif "bge-small" in current_model_name.lower():
+        logger.warning(f"Could not dynamically determine embedding dimension for {current_model_name}. Falling back to 384 (common for bge-small models).")
+        return 384
+    else:
+        # General fallback if model name doesn't give a hint
+        default_dim = 1024 # Defaulting to a common large dimension as a last resort
+        logger.error(f"Could not dynamically determine embedding dimension for {current_model_name} and no specific fallback known. Falling back to a general default: {default_dim}. THIS MAY BE INCORRECT AND CAUSE INDEXING ERRORS.")
+        return default_dim
 
 def create_and_persist_index(documents: List[Document], vector_store_path_str: str) -> bool:
     """Creates a FAISS vector index from documents and persists it to disk.
@@ -199,58 +217,3 @@ def run_indexing_pipeline(settings_override: Optional[AppSettings] = None):
     if settings_override:
         configure_llama_index_globals(get_active_settings()) # Restore to module's active settings
         logger.info("Restored LlamaIndex globals to initial active settings after override.")
-
-if __name__ == "__main__":
-    import sys
-    PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-    if str(PROJECT_ROOT) not in sys.path:
-        sys.path.insert(0, str(PROJECT_ROOT))
-    
-    # AppSettings is already imported from simple_rag_pipeline.config at the top level
-    # We also have `_active_settings` available from the module scope.
-
-    logger.info("--- Starting Indexing Service Test --- ")
-    
-    current_test_settings = get_active_settings() # Start with initial settings
-
-    env_file_path = PROJECT_ROOT / ".env"
-    if not env_file_path.exists():
-        with open(env_file_path, "w") as f:
-            f.write("OPENAI_API_KEY=sk-dummykeyfortestingfromindexingservice\n")
-        logger.info(f"Created dummy .env file at {env_file_path} for testing purposes.")
-        # Reload settings from the newly created .env file for this test run
-        current_test_settings = AppSettings() # This is a new local instance for testing
-        logger.info(f"Reloaded AppSettings for test due to .env creation.")
-        # Note: LlamaIndex globals will be reconfigured by run_indexing_pipeline if override is passed
-
-    test_data_dir = Path(current_test_settings.documents_dir)
-    if not test_data_dir.exists():
-        test_data_dir.mkdir(parents=True, exist_ok=True)
-    
-    sample_files_content = {
-        "sample_doc1_is.txt": "The quick brown fox jumps over the lazy dog for indexing service.",
-        "sample_doc2_is.txt": "LangChain and LlamaIndex are popular for RAG. This is another test document.",
-    }
-    for filename, content in sample_files_content.items():
-        file_path = test_data_dir / filename
-        if not file_path.exists():
-            with open(file_path, "w") as f: f.write(content)
-            logger.info(f"Created sample file for test: {file_path}")
-
-    logger.info(f"Test using OpenAI API Key from settings: {current_test_settings.openai_api_key and current_test_settings.openai_api_key != 'your_openai_api_key_here_if_not_in_env'}")
-    # LlamaSettings are global, their state depends on last call to configure_llama_index_globals
-    logger.info(f"Test using Embedding Model from LlamaSettings (will be set by run_indexing_pipeline if overridden): {LlamaSettings.embed_model}")
-
-    test_vector_store_dir = Path(current_test_settings.vector_store_path)
-    if test_vector_store_dir.exists():
-        logger.info(f"Removing existing test index at {test_vector_store_dir} for a clean run.")
-        shutil.rmtree(test_vector_store_dir)
-    test_vector_store_dir.parent.mkdir(parents=True, exist_ok=True)
-    
-    run_indexing_pipeline(settings_override=current_test_settings) # Pass the potentially modified settings
-    logger.info("--- Indexing Service Test Run Complete ---")
-
-    if test_vector_store_dir.exists() and any(f for f in test_vector_store_dir.iterdir() if f.name != '.gitkeep'):
-        logger.info(f"Index files found in {test_vector_store_dir}. Content: {[f.name for f in test_vector_store_dir.iterdir()]}")
-    else:
-        logger.error(f"Index directory {test_vector_store_dir} is empty or does not exist after test indexing (or only contains .gitkeep).") 

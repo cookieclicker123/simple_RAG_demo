@@ -3,8 +3,7 @@
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from uuid import UUID, uuid4
-from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
 
 # Example Pydantic model (can be expanded later)
 class DocumentMetadata(BaseModel):

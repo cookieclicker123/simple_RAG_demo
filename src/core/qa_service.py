@@ -273,140 +273,95 @@ def _create_document_citations(source_nodes: List[NodeWithScore], llm_for_titles
 
 def stream_chat_response(query: str, chat_engine: BaseChatEngine) -> Generator[Union[str, List[DocumentCitation]], None, None]:
     logger.info(f"User query (for streaming with citations): {query}")
-    # Accessing and printing debug information would ideally happen after the call.
-    # For now, the LlamaDebugHandler is set to print_trace_on_end=True, which should output to console.
-    # We can add more specific logging of its contents later if needed.
     try:
-        # Ensure this path is for RetrieverQueryEngine
         if isinstance(chat_engine, RetrieverQueryEngine):
             logger.info("Using RetrieverQueryEngine directly, with response_gen for streaming...")
-            
             query_start_time = datetime.now(timezone.utc)
-            original_query = query # Capture original query
-            condensed_query_text = None # Placeholder, RQE doesn't readily expose this
-
-            response = chat_engine.query(query) # Call query(), expect Response object
+            original_query = query
+            response = chat_engine.query(query)
             
             full_response_text_parts = []
-            # Yield tokens from the response_gen attribute
             if hasattr(response, 'response_gen') and response.response_gen:
                 for token in response.response_gen:
-                    full_response_text_parts.append(token)
-                    yield token
-            elif response.response: 
+                    full_response_text_parts.append(token); yield token
+            elif response.response:
                 logger.warning("RetrieverQueryEngine response does not have response_gen, yielding full response text.")
-                full_response_text_parts.append(str(response.response))
-                yield str(response.response)
+                full_response_text_parts.append(str(response.response)); yield str(response.response)
             else:
                 logger.warning("RetrieverQueryEngine response has no response_gen and no response text.")
-                full_response_text_parts.append("Error: Could not get a streamable or complete response from query engine.")
-                yield "Error: Could not get a streamable or complete response from query engine."
-            
+                err_msg = "Error: Could not get a streamable or complete response from query engine."
+                full_response_text_parts.append(err_msg); yield err_msg
             final_answer_text = "".join(full_response_text_parts)
 
-            # --- Observe raw BM25 results (for logging/debug) ---
             bm25_raw_snippets_for_log: Optional[List[str]] = None
-            # Attempt to get the bm25_retriever from the hybrid retriever
             if isinstance(chat_engine.retriever, QueryFusionRetriever):
                 actual_bm25_retriever = None
-                # Try accessing via _retrievers (common private attribute name)
                 if hasattr(chat_engine.retriever, '_retrievers'):
                     for r in chat_engine.retriever._retrievers:
                         if isinstance(r, BM25Retriever):
-                            actual_bm25_retriever = r
-                            break
-                else:
-                    logger.warning("QA_SERVICE: QueryFusionRetriever does not have '_retrievers' attribute.")
-                
+                            actual_bm25_retriever = r; break
                 if actual_bm25_retriever:
                     logger.info("QA_SERVICE: Retrieving raw BM25 results for observability...")
                     try:
-                        # Retrieve top N (e.g., 3) raw results from BM25
-                        # Use a different similarity_top_k for this observability query if needed,
-                        # or rely on its configured one.
-                        # For simplicity, let's assume its default similarity_top_k is reasonable for a peek.
-                        # To be more explicit, we could set it: actual_bm25_retriever.similarity_top_k = 3
                         raw_bm25_nodes = actual_bm25_retriever.retrieve(original_query)
                         if raw_bm25_nodes:
                             bm25_raw_snippets_for_log = []
                             logger.info(f"QA_SERVICE: Raw BM25 nodes found: {len(raw_bm25_nodes)}")
-                            for i, node_ws in enumerate(raw_bm25_nodes[:3]): # Log top 3 snippets
-                                # Include full content for the snippet in the JSON
-                                snippet = f"BM25 Raw {i+1} (Score: {node_ws.score:.4f}): {node_ws.node.get_content()}" 
+                            for i, node_ws in enumerate(raw_bm25_nodes[:3]):
+                                snippet = f"BM25 Raw {i+1} (Score: {node_ws.score:.4f}): {node_ws.node.get_content()}"
                                 bm25_raw_snippets_for_log.append(snippet)
-                                # For console logging, still truncate to avoid flooding the console
                                 logger.info(f"  Snippet for RAGResponse (console log truncated): BM25 Raw {i+1} (Score: {node_ws.score:.4f}): {node_ws.node.get_content()[:200]}...") 
-                        else:
-                            logger.info("QA_SERVICE: No raw results from BM25 retriever for this query.")
-                    except Exception as e_bm25_raw:
-                        logger.error(f"QA_SERVICE: Error retrieving raw BM25 results: {e_bm25_raw}", exc_info=True)
-                else:
-                    logger.warning("QA_SERVICE: BM25Retriever not found within the QueryFusionRetriever.")
-            else:
-                logger.warning("QA_SERVICE: Chat engine's retriever is not a QueryFusionRetriever. Cannot get raw BM25 results.")
-            # --- End Observe raw BM25 results ---
+                        else: logger.info("QA_SERVICE: No raw results from BM25 retriever for this query.")
+                    except Exception as e_bm25_raw: logger.error(f"QA_SERVICE: Error retrieving raw BM25 results: {e_bm25_raw}", exc_info=True)
+                else: logger.warning("QA_SERVICE: BM25Retriever not found within the QueryFusionRetriever.")
+            else: logger.warning("QA_SERVICE: Chat engine's retriever is not a QueryFusionRetriever. Cannot get raw BM25 results.")
 
-            # Log and process source nodes after streaming is complete (or response is obtained)
-            source_nodes = response.source_nodes
+            source_nodes = response.source_nodes if hasattr(response, 'source_nodes') else []
             source_node_details_for_rag: List[RAGSourceNodeDetail] = []
-
-            # Process source nodes for RAGResponse details AND for citations (titles are linked)
-            citations_generated: List[DocumentCitation] = [] # Initialize here
+            citations_generated: List[DocumentCitation] = []
             llm_for_titles_instance = LlamaSettings.llm
             if not isinstance(llm_for_titles_instance, LlamaIndexOpenAI):
-                 logger.warning(f"LlamaSettings.llm (type: {type(llm_for_titles_instance)}) is not LlamaIndexOpenAI. Title extraction for RAGSourceNodeDetail might fail or use fallback.")
+                 logger.warning(f"LlamaSettings.llm (type: {type(llm_for_titles_instance)}) is not LlamaIndexOpenAI. Title extraction may use fallback.")
 
             if source_nodes:
-                # First, create citations which also generates/extracts titles
                 citations_generated = _create_document_citations(source_nodes, llm_for_titles_instance) # type: ignore
-                
-                # Now, populate RAGSourceNodeDetail using titles from citations where possible
                 for i, node_ws in enumerate(source_nodes):
                     node_content = node_ws.node.get_content()
+                    node_metadata = node_ws.node.metadata or {}
                     node_title = "N/A"
-                    # Try to find the corresponding citation for this node to reuse its title
                     if i < len(citations_generated) and \
-                       citations_generated[i].file_path == node_ws.node.metadata.get("file_path") and \
-                       citations_generated[i].page_label == node_ws.node.metadata.get("page_label"):
+                       citations_generated[i].file_path == node_metadata.get("file_path") and \
+                       str(citations_generated[i].page_label) == str(node_metadata.get("page_label")):
                        node_title = citations_generated[i].document_title or "N/A"
-                    else: # Fallback if no match or out of bounds, try to generate title for the current node
-                        logger.warning(f"Citation not matched or out of bounds for node {i}, attempting direct title generation.")
+                    else: 
                         if isinstance(llm_for_titles_instance, LlamaIndexOpenAI):
-                            generated_title_for_node = _get_title_for_chunk_from_llm(node_content, llm_for_titles_instance, Path(node_ws.node.metadata.get("file_path", "Unknown Document")).stem)
-                            if generated_title_for_node: 
-                                node_title = generated_title_for_node 
+                            generated_title_for_node = _get_title_for_chunk_from_llm(node_content, llm_for_titles_instance, Path(node_metadata.get("file_path", "Unknown Document")).stem)
+                            if generated_title_for_node: node_title = generated_title_for_node
                     
                     normalized_node_score = None
                     if node_ws.score is not None:
-                        try:
+                        try: 
                             normalized_node_score = 1 / (1 + math.exp(-node_ws.score)) # Sigmoid normalization
                         except OverflowError:
-                            # Handle extreme scores that might cause overflow in math.exp()
-                            # If -node_ws.score is very large (node_ws.score very negative), exp result is huge -> normalized_score is near 0
-                            # If -node_ws.score is very small (node_ws.score very positive), exp result is near 0 -> normalized_score is near 1
                             normalized_node_score = 0.0 if node_ws.score < 0 else 1.0 
                             logger.warning(f"OverflowError during sigmoid normalization for score {node_ws.score}. Assigned {normalized_node_score}")
 
                     source_node_details_for_rag.append(
                         RAGSourceNodeDetail(
                             node_id=node_ws.node.node_id,
-                            file_path=node_ws.node.metadata.get("file_path"),
-                            page_label=node_ws.node.metadata.get("page_label"),
-                            score=normalized_node_score, # Store normalized score
+                            file_path=node_metadata.get("file_path"),
+                            page_label=str(node_metadata.get("page_label", "N/A")), 
+                            score=normalized_node_score, # Use normalized score
                             node_title=node_title, 
-                            full_text_content=node_content # Store full content
+                            full_text_content=node_content
                         )
                     )
-            # Do NOT yield citations_generated here anymore to keep terminal clean
-            # yield citations_generated 
-
+            
             query_end_time = datetime.now(timezone.utc)
-            processing_duration = (query_end_time - query_start_time).total_seconds()
-
             rag_response_data = RAGResponse(
                 query_time_utc=query_start_time,
                 response_time_utc=query_end_time,
-                processing_duration_seconds=processing_duration,
+                processing_duration_seconds=(query_end_time - query_start_time).total_seconds(),
                 original_query=original_query,
                 llm_model_used=LlamaSettings.llm.model if LlamaSettings.llm and hasattr(LlamaSettings.llm, 'model') else str(LlamaSettings.llm),
                 embedding_model_name_config=app_settings.embedding_model_name,
@@ -417,9 +372,9 @@ def stream_chat_response(query: str, chat_engine: BaseChatEngine) -> Generator[U
                 source_nodes_details=source_node_details_for_rag,
                 final_answer_text=final_answer_text,
                 citations_generated=citations_generated,
-                bm25_raw_retrieved_snippets=bm25_raw_snippets_for_log
+                bm25_raw_retrieved_snippets=bm25_raw_snippets_for_log,
+                expanded_queries=None # Explicitly None as query expansion is not active in this version
             )
-
             output_file_path = TMP_DIR / "latest_rag_response.json"
             try:
                 with open(output_file_path, 'w', encoding='utf-8') as f:
@@ -428,135 +383,16 @@ def stream_chat_response(query: str, chat_engine: BaseChatEngine) -> Generator[U
             except Exception as e:
                 logger.error(f"Failed to write RAG response to JSON: {e}", exc_info=True)
             
-            logger.info("QA_SERVICE: stream_chat_response is ABOUT TO YIELD FINAL SENTINEL BEFORE RETURN")
             yield "QA_SERVICE_STREAM_ENDED_SENTINEL"
-            logger.info("QA_SERVICE: stream_chat_response is ABOUT TO RETURN")
             return 
-        else: # Should not happen if initialize_chat_engine only returns RetrieverQueryEngine or None
+        else: 
             logger.error(f"Engine is not a RetrieverQueryEngine. Type: {type(chat_engine)}. Cannot process.")
             yield "Error: Chat engine is not correctly configured."
             yield []
             return
-
-        # Code for StreamingAgentChatResponse (CondensePlusContextChatEngine) is now effectively bypassed
-        # streaming_response: StreamingAgentChatResponse = chat_engine.stream_chat(query)
-        
-        # # Log the content of source nodes after reranking
-        # if hasattr(streaming_response, 'source_nodes') and streaming_response.source_nodes:
-        #     logger.info("--- CONTENT OF RERANKED SOURCE NODES ---")
-        #     for i, node_with_score in enumerate(streaming_response.source_nodes):
-        #         logger.info(f"Source Node {i+1} (Score: {node_with_score.score:.4f}):\n"
-        #                     f"  ID: {node_with_score.node.node_id}\n"
-        #                     f"  File: {node_with_score.node.metadata.get('file_path', 'N/A')}\n"
-        #                     f"  Page: {node_with_score.node.metadata.get('page_label', 'N/A')}\n"
-        #                     f"  First 200 chars: {node_with_score.node.get_content()[:200]}..."
-        #         )
-        #     logger.info("--- END CONTENT OF RERANKED SOURCE NODES ---")
-        # else:
-        #     logger.info("No source nodes found in streaming_response to log content.")
-
-        # Yield tokens from the generator
-        # if hasattr(streaming_response, 'response_gen'):
-        #     for token in streaming_response.response_gen:
-        #         yield token
-        # else:
-        #     logger.warning("Streaming response object does not have 'response_gen'.")
-        #     if hasattr(streaming_response, 'response') and streaming_response.response:
-        #          yield str(streaming_response.response) # Yield the whole response as one chunk
-        #     else:
-        #         yield "Error: Could not get a streamable or complete response."
-        #         # Early exit if no response parts can be obtained.
-        #         # Process source nodes even if response_gen is missing but source_nodes exist.
-
-        # After all tokens, process source nodes for citations
-        # citations = []
-        # if hasattr(streaming_response, 'source_nodes') and streaming_response.source_nodes:
-        #     logger.info("--- RERANKING CONFIRMATION ---")
-        #     logger.info(f"Initial retrieval configured for top_k={settings.retriever_similarity_top_k} candidates.")
-        #     logger.info(f"Reranker model='{settings.reranker_model_name}' configured for top_n={settings.reranker_top_n}.")
-        #     logger.info(f"After reranking, {len(streaming_response.source_nodes)} nodes remain for citation processing.")
-        #     logger.info("--- END RERANKING CONFIRMATION ---")
-        #     # Ensure LlamaSettings.llm is appropriate for title extraction (OpenAI compatible for .chat)
-        #     llm_for_titles = LlamaSettings.llm 
-        #     if not isinstance(llm_for_titles, LlamaIndexOpenAI):
-        #          logger.warning(f"LlamaSettings.llm (type: {type(llm_for_titles)}) is not LlamaIndexOpenAI. Title extraction might fail or use fallback.")
-        #          # Optionally, create a specific OpenAI instance here if LlamaSettings.llm is not suitable.
-        #          # For now, we pass it and _get_title_for_chunk_from_llm will handle it or fallback.
-        #     citations = _create_document_citations(streaming_response.source_nodes, llm_for_titles)
-        # else:
-        #     logger.info("No source nodes found in streaming response for citations.")
-        
-        # yield citations # Yield the list of citation objects
-
     except Exception as e:
         logger.error(f"Error getting streaming chat response with citations: {e}", exc_info=True)
         yield "Sorry, I encountered an error while processing your request."
-        yield [] # Yield empty list for citations in case of error
-
-if __name__ == "__main__":
-    # This test block requires an existing index and a configured OpenAI API key.
-    import sys
-    #from pathlib import Path # Already imported
-    PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-    if str(PROJECT_ROOT) not in sys.path:
-        sys.path.insert(0, str(PROJECT_ROOT))
-    
-    from src.core.indexing_service import get_active_settings as resolve_embed_model_settings, configure_llama_index_globals
-    from src.config import AppSettings
-
-    logger.info("--- QA Service Test (Streaming with LLM Citations) --- ")
-    if not app_settings.openai_api_key or app_settings.openai_api_key == "your_openai_api_key_here_if_not_in_env":
-        logger.warning("OPENAI_API_KEY not found. Test might fail.")
-        # exit(1)
-    
-    _test_settings = AppSettings()
-    # Must configure LlamaIndex globals, including embed_model for index loading
-    # and the LLM for the chat engine, using current settings.
-    configure_llama_index_globals(_test_settings) 
-    # The module-level LLM config runs on import. If _test_settings differs (e.g., .env changed),
-    # we might need to re-apply LlamaSettings.llm specifically if configure_llama_index_globals doesn't cover it for qa_service's needs.
-    # However, configure_llama_index_globals *should* set LlamaSettings.embed_model AND LlamaSettings.chunk_size/overlap.
-    # The LLM for qa_service is also set at the module level when this file is imported.
-    # To be absolutely sure the test uses the LLM from the reloaded _test_settings:
-    if not LlamaSettings.llm or (hasattr(LlamaSettings.llm, 'model') and LlamaSettings.llm.model != _test_settings.llm_model_name):
-        logger.info(f"Re-configuring LlamaSettings.llm for test with: {_test_settings.llm_model_name}")
-        LlamaSettings.llm = LlamaIndexOpenAI(
-            model=_test_settings.llm_model_name,
-            temperature=_test_settings.temperature,
-            api_key=_test_settings.openai_api_key,
-            max_tokens=_test_settings.max_tokens,
-            system_prompt=INVESTOR_SYSTEM_PROMPT
-        )
-
-    logger.info(f"Test - LlamaSettings.llm for QA: {LlamaSettings.llm.model if LlamaSettings.llm else 'None'}")
-    logger.info(f"Test - LlamaSettings.embed_model: {LlamaSettings.embed_model}")
-
-    test_chat_engine = initialize_chat_engine()
-    if test_chat_engine:
-        print("Streaming chat engine initialized. Enter queries or type 'exit'.")
-        while True:
-            user_query = input("You: ")
-            if user_query.lower() == 'exit':
-                break
-            print("AI: ", end="", flush=True)
-            final_citations = []
-            for response_part in stream_chat_response(user_query, test_chat_engine):
-                if isinstance(response_part, str):
-                    print(response_part, end="", flush=True)
-                elif isinstance(response_part, list): # It's the citations list
-                    final_citations = response_part
-            print() # Newline after full response
-            if final_citations:
-                print("\n--- Citations (Title from LLM) ---")
-                for cit in final_citations:
-                    print(f"  ID: {cit.document_id}")
-                    print(f"  Name: {cit.document_name}")
-                    print(f"  Title: {cit.document_title}")
-                    print(f"  Path: {cit.file_path}")
-                    print(f"  Page: {cit.page_label}")
-                    print(f"  Snippet: {cit.snippet}\n")
-            else:
-                print("(No citations found or error in processing them)")
-    else:
-        print("Failed to initialize chat engine for testing.")
-    logger.info("--- QA Service Test (Streaming with LLM Citations) Complete ---") 
+        yield [] 
+    finally:
+        pass

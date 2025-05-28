@@ -69,13 +69,3 @@ if not Path(settings.documents_dir).exists():
 vector_store_parent_dir = Path(settings.vector_store_path).parent
 if not vector_store_parent_dir.exists():
     vector_store_parent_dir.mkdir(parents=True, exist_ok=True)
-
-if __name__ == "__main__":
-    # For testing the configuration loading
-    print(f"Calculated ROOT_DIR: {ROOT_DIR}")
-    print(f"OpenAI API Key Loaded: {'Yes' if settings.openai_api_key and settings.openai_api_key != 'your_openai_api_key_here_if_not_in_env' else 'No'}")
-    print(f"OpenAI-Compatible LLM Model (for RAG): {settings.openai_compatible_llm_model_name}")
-    print(f"Embedding Model: {settings.embedding_model_name}")
-    print(f"Vector Store Path: {settings.vector_store_path}")
-    print(f"Documents Path: {settings.documents_dir}")
-    print(f"Log Level: {settings.log_level}") 

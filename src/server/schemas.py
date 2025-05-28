@@ -1,6 +1,4 @@
 from pydantic import BaseModel
-from typing import Optional, List
-
 class ChatQuery(BaseModel):
     query: str
     # session_id: Optional[str] = None # Could add session management later

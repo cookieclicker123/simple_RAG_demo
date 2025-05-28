@@ -2,7 +2,6 @@ import uvicorn
 import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware # For potential CORS configuration
-import asyncio # Import asyncio for lifespan
 
 from src.server.routes import router as api_router
 from src.config import settings # For log level or other app-wide settings

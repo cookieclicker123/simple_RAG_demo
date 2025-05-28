@@ -74,30 +74,3 @@ def load_faiss_index_from_storage(vector_store_path_str: str) -> tuple[Optional[
     except Exception as e:
         logger.error(f"General error loading FAISS index from {vector_store_root_path}: {e}", exc_info=True)
         return None, None
-
-if __name__ == "__main__":
-    import sys
-    PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-    if str(PROJECT_ROOT) not in sys.path:
-        sys.path.insert(0, str(PROJECT_ROOT))
-
-    from src.core.indexing_service import configure_llama_index_globals, get_active_settings as get_is_settings
-    # Use settings from the config module directly, it should be consistent
-    # from src.config import settings as main_settings 
-
-    active_test_settings = get_is_settings()
-    configure_llama_index_globals(active_test_settings)
-    logger.info(f"vector_store_handlers test: LlamaSettings.embed_model configured to: {LlamaSettings.embed_model}")
-
-    logger.info(f"Attempting to load index from: {settings.vector_store_path}")
-    # Pass settings.index_id from config to the loading function (it has a default in the func signature anyway)
-    loaded_index, loaded_storage_context = load_faiss_index_from_storage(settings.vector_store_path)
-
-    if loaded_index and loaded_storage_context:
-        print(f"\n--- vector_store_handlers.py: Successfully loaded index and storage_context ---")
-        print(f"Index ID from loaded index: {loaded_index.index_id}") 
-        print(f"Docstore available in storage_context: {loaded_storage_context.docstore is not None}")
-    else:
-        print("\n--- vector_store_handlers.py: Failed to load index and/or storage_context. ---")
-        print(f"Please ensure an index exists at '{settings.vector_store_path}'. You can create one by running:")
-        print(f"python -m src.core.indexing_service") # Corrected module path for direct run 

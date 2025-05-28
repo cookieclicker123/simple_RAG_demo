@@ -3,7 +3,6 @@ import logging
 import json
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from typing import List # Import List for type hinting
 
 from src.server.schemas import ChatQuery # , StreamResponse # StreamResponse might be used if not directly yielding strings
 from src.server.services import stream_qa_responses, get_chat_engine
