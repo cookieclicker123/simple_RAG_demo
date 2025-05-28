@@ -5,6 +5,9 @@ from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
 
+# Suppress HuggingFace tokenizer parallelism warning
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -23,7 +26,11 @@ class AppSettings(BaseSettings):
     llm_model_name: str = "gpt-4o-mini"
     
     temperature: float = 0.1
-    max_tokens: int = 1024 # Increased for potentially more complex agent responses
+    max_tokens: int = 2048 # Increased for potentially more complex agent responses
+
+    # Ollama LLM for Query Expansion
+    ollama_model_for_query_expansion: str = "gemma3:4b" # Default to gemma:2b for query expansion
+    ollama_request_timeout: float = 120.0
 
     # Embedding Model Configuration
     embedding_model_name: str = "BAAI/bge-large-en-v1.5"
@@ -47,7 +54,7 @@ class AppSettings(BaseSettings):
     reranker_top_n: int = 5  # Number of candidates to keep after reranking
 
     # Logging Configuration (placeholder)
-    log_level: str = "INFO"
+    log_level: str = "DEBUG"
 
     # Chat Engine Configuration (examples, can be tuned)
     chat_memory_token_limit: int = 3000
