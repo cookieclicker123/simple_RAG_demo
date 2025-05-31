@@ -3,6 +3,7 @@ import httpx
 import json
 import logging
 import uuid
+import os
 
 # Import the new schemas for type safety
 from src.server.schemas import IndexStatus
@@ -15,6 +16,9 @@ from src.utils.polling import poll_for_indexing_completion
 from src.utils.user_interaction import user_prompts
 from src.utils.http_client import api_client
 from src.config import settings
+
+# Configuration - Add this near the top of the file after imports
+USE_AGENT_FRAMEWORK = os.getenv("USE_AGENT_FRAMEWORK", "true").lower() == "true"
 
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -172,7 +176,15 @@ async def get_streaming_chat_response(query: str):
         "query": query,
         "session_id": current_session_id
     }
-    stream_endpoint = api_client.endpoints['stream_chat']
+    
+    # Choose endpoint based on configuration
+    endpoint_key = 'agent_stream_chat' if USE_AGENT_FRAMEWORK else 'stream_chat'
+    stream_endpoint = api_client.endpoints[endpoint_key]
+    
+    if USE_AGENT_FRAMEWORK:
+        logger.info(f"Using agent framework endpoint: {stream_endpoint}")
+    else:
+        logger.info(f"Using legacy chat endpoint: {stream_endpoint}")
     
     try:
         async with httpx.AsyncClient(timeout=None) as client: # Timeout None for long streams
@@ -273,6 +285,14 @@ async def show_conversation_memory():
 
 async def main():
     user_prompts.show_app_header()
+    
+    # Show which framework is being used
+    if USE_AGENT_FRAMEWORK:
+        print("🤖 Agent Framework Mode: Using meta-agent with RAG tool orchestration")
+        print("   Features: Query enhancement, tool selection, and rich metadata")
+    else:
+        print("📚 Legacy Mode: Direct RAG chat interface")
+    print()
 
     ready_to_chat = await check_and_manage_index()
     if not ready_to_chat:

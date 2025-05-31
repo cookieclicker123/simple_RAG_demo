@@ -12,7 +12,7 @@ from collections import defaultdict
 
 from src.server.schemas import ChatQuery, IndexingResponse, IndexStatusResponse, UserQueryRequest, IndexTriggerResponse, IndexingStatusCheck, IndexCompletionRequest, IndexCleanupResponse
 # Import from original services and models for the pre-ADK RAG flow
-from src.server.services import stream_qa_responses, get_chat_engine
+from src.server.services import stream_qa_responses, get_chat_engine, stream_agent_responses, get_agent_framework_info
 from src.models import DocumentCitation, ConversationMemory
 from src.core.indexing_service import run_indexing_pipeline
 from src.config import settings # Import settings for paths
@@ -49,12 +49,39 @@ async def root():
 
 @router.get("/health")
 async def health_check():
-    """Health check endpoint."""
-    return {
-        "status": "healthy",
-        "chat_engine_available": chat_engine is not None,
-        "active_conversations": len(conversation_memories)
-    }
+    """Enhanced health check endpoint with agent framework status."""
+    try:
+        # Get basic health info
+        basic_health = {
+            "status": "healthy",
+            "chat_engine_available": chat_engine is not None,
+            "active_conversations": len(conversation_memories)
+        }
+        
+        # Add agent framework info
+        try:
+            framework_info = get_agent_framework_info()
+            basic_health["agent_framework"] = {
+                "available": True,
+                "version": framework_info["framework_version"],
+                "tools_count": len(framework_info["available_tools"]),
+                "meta_agent_available": framework_info["meta_agent_available"]
+            }
+        except Exception as e:
+            logger.warning(f"Agent framework not available in health check: {e}")
+            basic_health["agent_framework"] = {
+                "available": False,
+                "error": str(e)
+            }
+        
+        return basic_health
+        
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return {
+            "status": "unhealthy",
+            "error": str(e)
+        }
 
 @router.post("/chat/stream")
 async def stream_chat(request: UserQueryRequest):
@@ -376,4 +403,155 @@ async def simple_chat(query: ChatQuery):
     # For now, let's just acknowledge and return a placeholder
     # response_text = await get_simple_qa_response(query.query)
     # return {"response": response_text}
-    return {"message": "Simple chat endpoint placeholder. Implement if needed.", "query_received": query.query} 
+    return {"message": "Simple chat endpoint placeholder. Implement if needed.", "query_received": query.query}
+
+# AGENT FRAMEWORK ROUTES
+
+@router.post("/agent/chat/stream")
+async def stream_agent_chat(request: UserQueryRequest):
+    """
+    Stream chat responses using the agent framework with meta-agent orchestration.
+    
+    This endpoint uses the new agent framework for intelligent tool selection,
+    conversation memory, and response generation. The meta-agent coordinates
+    between available tools (RAG, future calculators, translators, etc.).
+    
+    Features:
+    - Intelligent tool selection via LLM reasoning
+    - Enhanced conversation memory integration
+    - Rich metadata and observability
+    - Extensible for future sub-agents
+    """
+    global chat_engine
+    
+    if not chat_engine:
+        raise HTTPException(status_code=500, detail="Chat engine not initialized")
+    
+    if not request.query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+    
+    # Get or create conversation memory
+    session_id = request.session_id or str(uuid.uuid4())
+    conversation_memory = conversation_memories[session_id]
+    
+    logger.info(f"Agent framework: Processing query for session {session_id}: {request.query}")
+    
+    # Use the new agent-based stream function
+    request_id = str(uuid.uuid4())
+    
+    async def generate_agent_response():
+        """Generate streaming response using the agent framework."""
+        try:
+            event_count = 0
+            citations_sent = False
+            
+            async for item in stream_agent_responses(request.query, session_id, conversation_memory):
+                event_count += 1
+                
+                if isinstance(item, str):
+                    logger.debug(f"Agent Request [{request_id}] Event_gen item #{event_count} (str): '{item[:100]}...'")
+                    
+                    payload = {"token": item}
+                    event_data = f"data: {json.dumps(payload)}\n\n"
+                    yield event_data.encode()
+                
+                elif isinstance(item, list):
+                    # This should be the citations list
+                    logger.debug(f"Agent Request [{request_id}] Event_gen item #{event_count} (list): citations with {len(item)} items")
+                    citations_data = []
+                    for citation in item:
+                        if hasattr(citation, '__dict__'):
+                            citations_data.append(citation.__dict__)
+                        else:
+                            citations_data.append(citation)
+                    
+                    payload = {"citations": citations_data}
+                    event_data = f"data: {json.dumps(payload)}\n\n"
+                    yield event_data.encode()
+                    citations_sent = True
+                
+                else:
+                    # Unexpected type
+                    logger.warning(f"Agent Request [{request_id}] Unexpected item type in stream: {type(item)}")
+                    continue
+                    
+            # Send final event to signal completion
+            logger.info(f"Agent Request [{request_id}] Stream complete. Events sent: {event_count}, Citations sent: {citations_sent}")
+            
+        except Exception as e:
+            logger.error(f"Agent Request [{request_id}] Error in generate_agent_response: {e}", exc_info=True)
+            error_payload = {"token": f"Error: {str(e)}", "error": True}
+            error_event = f"data: {json.dumps(error_payload)}\n\n"
+            yield error_event.encode()
+        
+        finally:
+            # Send stream end event
+            end_payload = {"event": "stream_end"}
+            end_event = f"data: {json.dumps(end_payload)}\n\n"
+            yield end_event.encode()
+            logger.debug(f"Agent Request [{request_id}] Final stream_end event sent")
+
+    return StreamingResponse(
+        generate_agent_response(),
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Session-ID": session_id,
+            "X-Agent-Framework": "true"
+        }
+    )
+
+@router.get("/agent/info")
+async def get_agent_info():
+    """
+    Get information about the agent framework capabilities and available tools.
+    
+    Returns comprehensive information about:
+    - Available tools and their capabilities
+    - Agent framework version and features
+    - Tool registry statistics
+    - System capabilities
+    """
+    try:
+        framework_info = get_agent_framework_info()
+        return {
+            "status": "active",
+            "framework": framework_info,
+            "health": {
+                "chat_engine_available": chat_engine is not None,
+                "active_conversations": len(conversation_memories)
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error getting agent framework info: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get agent info: {str(e)}")
+
+@router.get("/agent/tools")
+async def list_agent_tools():
+    """
+    List all available tools in the agent framework.
+    
+    Returns detailed information about each tool including:
+    - Tool name and description
+    - Parameter schemas
+    - Usage examples
+    - Categories and tags
+    """
+    try:
+        from tools.tool_registry import tool_registry
+        
+        tools_info = []
+        for tool_name in tool_registry.list_tools():
+            tool_info = tool_registry.get_tool_info(tool_name)
+            if tool_info:
+                tools_info.append(tool_info)
+        
+        return {
+            "total_tools": len(tools_info),
+            "tools": tools_info,
+            "categories": tool_registry.list_categories()
+        }
+    except Exception as e:
+        logger.error(f"Error listing agent tools: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to list tools: {str(e)}") 

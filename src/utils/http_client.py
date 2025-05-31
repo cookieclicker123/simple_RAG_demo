@@ -19,7 +19,11 @@ class APIClient:
             'trigger_index': f"{self.base_url}/index/documents", 
             'check_completion': f"{self.base_url}/index/check-completion",
             'cleanup_index': f"{self.base_url}/index/cleanup",
-            'stream_chat': f"{self.base_url}/chat/stream"
+            'stream_chat': f"{self.base_url}/chat/stream",
+            # Agent framework endpoints
+            'agent_stream_chat': f"{self.base_url}/agent/chat/stream",
+            'agent_info': f"{self.base_url}/agent/info",
+            'agent_tools': f"{self.base_url}/agent/tools"
         }
     
     async def get_json(self, endpoint_key: str, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
