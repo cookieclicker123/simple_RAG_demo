@@ -1,5 +1,6 @@
 from pydantic import BaseModel
 from typing import Optional, List # Optional might be used by IndexingResponse, List for ChatQuery history
+from enum import Enum
 
 class ChatQuery(BaseModel):
     query: str
@@ -19,3 +20,21 @@ class IndexStatusResponse(BaseModel):
 class StreamResponse(BaseModel):
     token: str
     # Could add other fields like event_type (e.g., "token", "end", "error") 
+
+# New schemas for enhanced index management
+class IndexStatus(str, Enum):
+    EXISTS = "exists"
+    MISSING = "missing" 
+    EMPTY_DATA_FOLDER = "empty_data_folder"
+
+class IndexCheckResult(BaseModel):
+    status: IndexStatus
+    document_count: int
+    message: str
+    needs_indexing: bool
+    can_proceed_without_indexing: bool = False
+
+class UserConfirmation(BaseModel):
+    confirmed: bool
+    action: str  # What action the user is confirming (e.g., "index_documents", "proceed_anyway")
+    message: str 

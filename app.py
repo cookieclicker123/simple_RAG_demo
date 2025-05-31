@@ -5,6 +5,9 @@ import sys
 import logging
 from typing import Optional
 
+# Import the new schemas for type safety
+from src.server.schemas import IndexStatus, IndexCheckResult, UserConfirmation
+
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -16,6 +19,82 @@ API_BASE_URL = "http://localhost:8000/api"
 STREAM_CHAT_ENDPOINT = f"{API_BASE_URL}/chat/stream"
 INDEX_STATUS_ENDPOINT = f"{API_BASE_URL}/index/status"
 TRIGGER_INDEX_ENDPOINT = f"{API_BASE_URL}/index/documents"
+
+async def get_enhanced_index_status() -> Optional[IndexCheckResult]:
+    """
+    Gets index status from server and returns a structured IndexCheckResult.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(INDEX_STATUS_ENDPOINT)
+            response.raise_for_status()
+            server_data = response.json()
+            
+        # Transform server response into our enhanced schema
+        exists = server_data.get('exists', False)
+        doc_count = server_data.get('document_count_in_data_folder', 0)
+        server_message = server_data.get('message', 'No message from server')
+        
+        if not exists and doc_count == 0:
+            status = IndexStatus.EMPTY_DATA_FOLDER
+            needs_indexing = False
+            can_proceed = False
+            message = "No index found and no documents in the data folder. Please add PDF documents to the server's 'data' folder first."
+        elif not exists and doc_count > 0:
+            status = IndexStatus.MISSING
+            needs_indexing = True
+            can_proceed = False
+            message = f"No index found, but {doc_count} document(s) are available for indexing."
+        else:  # exists
+            status = IndexStatus.EXISTS
+            needs_indexing = False
+            can_proceed = True
+            message = f"Index exists with {doc_count} document(s) in the data folder."
+            
+        return IndexCheckResult(
+            status=status,
+            document_count=doc_count,
+            message=message,
+            needs_indexing=needs_indexing,
+            can_proceed_without_indexing=can_proceed
+        )
+        
+    except httpx.RequestError as e:
+        logger.error(f"Error requesting index status: {e}")
+        print(f"\nError: Could not connect to server to get index status. Is it running at {API_BASE_URL}?")
+    except Exception as e:
+        logger.error(f"Error parsing index status response: {e}", exc_info=True)
+        print(f"\nError: Could not parse index status from server.")
+    return None
+
+def get_user_confirmation(prompt: str, action: str) -> UserConfirmation:
+    """
+    Gets user confirmation with type safety. Keeps asking until valid input.
+    """
+    while True:
+        try:
+            user_input = input(f"{prompt} (yes/no): ").strip().lower()
+            if user_input == 'yes':
+                return UserConfirmation(
+                    confirmed=True,
+                    action=action,
+                    message=f"User confirmed: {action}"
+                )
+            elif user_input == 'no':
+                return UserConfirmation(
+                    confirmed=False,
+                    action=action,
+                    message=f"User declined: {action}"
+                )
+            else:
+                print("Invalid input. Please type 'yes' or 'no'.")
+        except (KeyboardInterrupt, EOFError):
+            print("\nOperation cancelled by user.")
+            return UserConfirmation(
+                confirmed=False,
+                action="cancelled",
+                message="User cancelled the operation"
+            )
 
 async def get_index_status_from_server() -> Optional[dict]:
     try:
@@ -60,63 +139,102 @@ async def trigger_server_indexing() -> bool:
     return False
 
 async def check_and_manage_index() -> bool:
-    """Checks index status and prompts user to index if needed. Returns True if ready to chat."""
+    """
+    Enhanced index checking with continuous prompting and type safety.
+    Returns True if ready to chat, never terminates the app for missing index.
+    """
     print("Checking document index status...")
-    status_data = await get_index_status_from_server()
-
-    if not status_data:
-        print("Could not retrieve index status from the server. Please ensure the server is running.")
-        return False # Cannot proceed
-
-    print(f"Server: {status_data.get('message', 'No status message.')}")
-
-    if not status_data.get('exists'):
-        if status_data.get('document_count_in_data_folder', 0) == 0:
-            print("No documents found in the server's 'data' folder. Please add PDF documents there and try again.")
-            return False # Cannot proceed
-        
-        while True:
-            choice = input("No index found. Would you like to index documents from the server's 'data' folder now? (yes/no): ").strip().lower()
-            if choice == 'yes':
-                if await trigger_server_indexing():
-                    print("Please allow some time for indexing to complete on the server before proceeding.")
-                    # Ideally, we'd poll /index/status here, but for simplicity, we'll just proceed after a delay or user prompt.
-                    input("Press Enter to continue once you believe indexing is complete...")
-                    # Re-check status after indexing attempt
-                    # status_data = await get_index_status_from_server()
-                    # if status_data and status_data.get('exists'):
-                    #     print(f"Server: {status_data.get('message', 'No status message.')}")
-                    #     return True
-                    # else:
-                    #     print("Indexing may have failed or is still in progress. Please check server logs.")
-                    #     return False
-                    return True # Assume success for now, user will see if chat fails
-                else:
-                    print("Failed to initiate indexing process on the server.")
-                    return False # Cannot proceed
-            elif choice == 'no':
-                print("Cannot proceed without an index. Exiting.")
-                return False
-            else:
-                print("Invalid input. Please type 'yes' or 'no'.")
-    else: # Index exists
-        if status_data.get('document_count_in_data_folder', 0) == 0:
-            print("Warning: Index exists, but no documents currently in the server's 'data' folder. Chatting will be based on the existing index content.")
-        
-        reindex_choice = input("An index already exists. Would you like to re-index with the current documents in the server's 'data' folder? (yes/no): ").strip().lower()
-        if reindex_choice == 'yes':
-            if await trigger_server_indexing():
-                print("Please allow some time for re-indexing to complete on the server.")
-                input("Press Enter to continue once you believe re-indexing is complete...")
-                return True # Assume success for now
-            else:
-                print("Failed to initiate re-indexing process on the server.")
-                # Choice to proceed with old index or not
-                proceed_anyway = input("Would you like to chat with the existing index anyway? (yes/no): ").strip().lower()
-                return proceed_anyway == 'yes'
-        # If 'no' to re-indexing, or if re-indexing failed and user chose not to proceed
     
-    return True # Ready to chat (either with existing index or after indexing was triggered)
+    # First check - determine initial state
+    status_result = await get_enhanced_index_status()
+    
+    if not status_result:
+        print("Could not retrieve index status from the server. Please ensure the server is running.")
+        return False  # Cannot proceed due to server connectivity issues
+    
+    print(f"\nStatus: {status_result.message}")
+    
+    # Handle different index status scenarios
+    if status_result.status == IndexStatus.EMPTY_DATA_FOLDER:
+        print("❌ Cannot proceed: No documents found in the server's 'data' folder.")
+        print("Please add PDF documents to the server's 'data' folder and restart the application.")
+        return False  # Cannot proceed without documents
+        
+    elif status_result.status == IndexStatus.MISSING:
+        # Index missing but documents available - require indexing
+        print(f"\n📁 Found {status_result.document_count} document(s) ready for indexing.")
+        print("🔄 The system will now index these documents to enable chat functionality.")
+        
+        # Keep asking until user confirms indexing (required for chat)
+        while True:
+            confirmation = get_user_confirmation(
+                "Proceed with indexing the documents", 
+                "index_documents"
+            )
+            
+            if confirmation.confirmed:
+                success = await trigger_server_indexing()
+                if success:
+                    print("✅ Indexing initiated successfully.")
+                    print("⏳ Please wait for indexing to complete...")
+                    input("Press Enter when you believe indexing is complete to continue...")
+                    # After indexing is complete, go DIRECTLY to chat
+                    print("✅ Proceeding to chat with newly created index.")
+                    return True  # Ready to chat
+                else:
+                    print("❌ Failed to initiate indexing. Please check server logs.")
+                    # Ask if they want to try again
+                    retry_confirmation = get_user_confirmation(
+                        "Would you like to try indexing again", 
+                        "retry_indexing"
+                    )
+                    if not retry_confirmation.confirmed:
+                        print("Cannot proceed without indexing. Please resolve the issue and restart.")
+                        return False
+                    # Continue loop to try again
+                    continue
+            else:
+                # User declined indexing - but we need it, so ask again
+                print("⚠️  Indexing is required to enable chat functionality.")
+                print("Without indexing, the system cannot answer questions about your documents.")
+                # Continue the loop to ask again
+                continue
+            
+    elif status_result.status == IndexStatus.EXISTS:
+        # Index already exists at startup - offer re-indexing option
+        if status_result.document_count == 0:
+            print("⚠️  Warning: Index exists, but no documents currently in the server's 'data' folder.")
+            print("Chat will be based on the existing index content.")
+        else:
+            print(f"✅ Index ready with {status_result.document_count} document(s).")
+        
+        # Give user option to re-index or proceed directly to chat
+        print("You can now start chatting, or optionally re-index the documents first.")
+        reindex_confirmation = get_user_confirmation(
+            "Would you like to re-index before chatting",
+            "reindex_documents"
+        )
+        
+        if reindex_confirmation.confirmed:
+            success = await trigger_server_indexing()
+            if success:
+                print("✅ Re-indexing initiated successfully.")
+                input("Press Enter when you believe re-indexing is complete to continue...")
+                # After re-indexing is complete, go DIRECTLY to chat
+                print("✅ Proceeding to chat with updated index.")
+                return True  # Ready to chat
+            else:
+                print("❌ Failed to initiate re-indexing.")
+                print("Proceeding with existing index.")
+                return True  # Ready to chat with existing index
+        else:
+            # User declined re-indexing, proceed with existing index
+            print("✅ Proceeding to chat with existing index.")
+            return True  # Ready to chat
+    
+    # This point should not be reached
+    print("Unexpected status. Please restart the application.")
+    return False
 
 async def get_streaming_chat_response(query: str):
     """
