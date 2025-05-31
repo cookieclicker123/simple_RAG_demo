@@ -19,28 +19,26 @@ _chat_engine_instance: BaseChatEngine | None = None
 _chat_engine_lock = asyncio.Lock() # To prevent race conditions during initialization
 
 async def initialize_global_chat_engine():
-    """Initializes the global chat engine instance. To be called at application startup."""
+    """Initializes the global chat engine instance. Can be called at startup or on demand."""
     global _chat_engine_instance
+    # Use the lock to ensure only one initialization attempt happens at a time
     async with _chat_engine_lock:
-        if _chat_engine_instance is None:
-            logger.info("Lifespan: Initializing global chat engine for FastAPI service at startup...")
+        # Check again inside the lock in case another coroutine was waiting and instance got set
+        if _chat_engine_instance is None: 
+            logger.info("Attempting to initialize global chat engine...")
             active_app_settings = get_active_settings()
-            # Configure LlamaIndex globals. This is synchronous.
-            # Running synchronous I/O bound task in a separate thread is good practice if it were slow, 
-            # but configure_llama_index_globals is likely CPU-bound and fast.
-            # For lifespan, it might be okay to run it directly if it's quick, or use to_thread.
             await asyncio.to_thread(configure_llama_index_globals, active_app_settings)
-            logger.info(f"Lifespan: LlamaSettings.llm: {LlamaSettings.llm.model if LlamaSettings.llm and hasattr(LlamaSettings.llm, 'model') else LlamaSettings.llm}")
-            logger.info(f"Lifespan: LlamaSettings.embed_model: {LlamaSettings.embed_model}")
+            logger.info(f"LlamaSettings.llm for engine init: {LlamaSettings.llm.model if LlamaSettings.llm and hasattr(LlamaSettings.llm, 'model') else LlamaSettings.llm}")
+            logger.info(f"LlamaSettings.embed_model for engine init: {LlamaSettings.embed_model}")
 
-            # sync_initialize_chat_engine can be blocking (loads models, index)
-            _chat_engine_instance = await asyncio.to_thread(sync_initialize_chat_engine)
-            if _chat_engine_instance:
-                logger.info("Lifespan: Global chat engine initialized successfully.")
+            temp_engine = await asyncio.to_thread(sync_initialize_chat_engine)
+            if temp_engine:
+                _chat_engine_instance = temp_engine
+                logger.info("Global chat engine initialized successfully.")
             else:
-                logger.error("Lifespan: Failed to initialize global chat engine.")
+                logger.error("Failed to initialize global chat engine during attempt.")
         else:
-            logger.info("Lifespan: Global chat engine already initialized.")
+            logger.info("Global chat engine was already initialized by another coroutine or at startup.")
 
 async def shutdown_global_chat_engine():
     """Placeholder for shutting down/releasing resources from the global chat engine."""
@@ -54,17 +52,18 @@ async def shutdown_global_chat_engine():
         _chat_engine_instance = None
         logger.info("Lifespan: Global chat engine instance released.")
     else:
-        logger.info("Lifespan: Global chat engine was not initialized.")
+        logger.info("Lifespan: Global chat engine was not initialized or already shut down.")
 
 async def get_chat_engine() -> BaseChatEngine | None:
     """
     Returns the globally initialized chat engine.
-    Relies on the startup event to have initialized the engine.
+    If not initialized, attempts to initialize it.
     """
     if _chat_engine_instance is None:
-        logger.warning("get_chat_engine called but global engine is not initialized. This might happen if accessed before startup or after shutdown.")
-        # Optionally, could try to initialize it here as a fallback, but ideally startup handles it.
-        # await initialize_global_chat_engine() # Fallback initialization, uncomment if needed but makes lifespan less distinct
+        logger.warning("get_chat_engine: Global engine is None. Attempting on-demand initialization.")
+        await initialize_global_chat_engine() # This will attempt to set _chat_engine_instance
+        if _chat_engine_instance is None:
+            logger.error("get_chat_engine: Engine is STILL None after on-demand initialization attempt.")
     return _chat_engine_instance
 
 async def stream_qa_responses(query: str) -> AsyncGenerator[Union[str, List[DocumentCitation]], None]:
@@ -73,7 +72,7 @@ async def stream_qa_responses(query: str) -> AsyncGenerator[Union[str, List[Docu
     """
     chat_engine = await get_chat_engine()
     if not chat_engine:
-        yield "Error: Chat engine not available. It may not have initialized correctly at startup."
+        yield "Error: Chat engine not available. Failed to initialize."
         yield [] 
         return
 
@@ -85,6 +84,7 @@ async def stream_qa_responses(query: str) -> AsyncGenerator[Union[str, List[Docu
         def run_sync_generator_in_thread(loop: asyncio.AbstractEventLoop):
             try:
                 logger.info(f"SERVICES.PY: run_sync_generator_in_thread starting for query: {query}")
+                # Pass the obtained chat_engine to the synchronous function
                 for item_count, item in enumerate(sync_stream_chat_response(query, chat_engine)):
                     logger.info(f"SERVICES.PY: run_sync_generator_in_thread received item #{item_count} from qa_service: '{str(item)[:100]}...'")
                     asyncio.run_coroutine_threadsafe(queue.put(item), loop).result()
