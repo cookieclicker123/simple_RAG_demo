@@ -14,6 +14,9 @@ from src.models import DocumentCitation
 from src.core.indexing_service import run_indexing_pipeline
 from src.config import settings # Import settings for paths
 
+# Add new imports for indexing completion detection
+from src.server.schemas import IndexingState, IndexingStatusCheck, IndexCompletionRequest
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
@@ -75,6 +78,73 @@ async def trigger_document_indexing(background_tasks: BackgroundTasks):
     except Exception as e:
         logger.error(f"Failed to schedule document indexing: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to initiate indexing: {str(e)}")
+
+@router.post("/index/check-completion", response_model=IndexingStatusCheck, tags=["Indexing"])
+async def check_indexing_completion(request: IndexCompletionRequest):
+    """
+    Checks if indexing is complete by verifying the required file structure exists.
+    Based on the file structure created by indexing_service.py.
+    """
+    logger.info("Received request to check indexing completion status.")
+    
+    # Define the required files for a complete index based on indexing_service.py
+    index_dir_path = Path(settings.vector_store_path)
+    
+    required_files = {
+        "faiss_index": index_dir_path / "vector_store" / "default__vector_store.faiss",
+        "docstore": index_dir_path / "docstore.json",
+        "index_store": index_dir_path / "index_store.json",
+        "bm25_engine": index_dir_path / "bm25_engine.pkl"
+    }
+    
+    # No optional files - all above are required
+    optional_files = {}
+    
+    files_found = []
+    files_missing = []
+    
+    # Check required files
+    for file_key, file_path in required_files.items():
+        if file_path.exists() and file_path.is_file():
+            files_found.append(str(file_path))
+            logger.debug(f"Found required file: {file_path}")
+        else:
+            files_missing.append(str(file_path))
+            logger.debug(f"Missing required file: {file_path}")
+    
+    # Check optional files (just for reporting, don't affect completion status)
+    for file_key, file_path in optional_files.items():
+        if file_path.exists() and file_path.is_file():
+            files_found.append(str(file_path))
+            logger.debug(f"Found optional file: {file_path}")
+    
+    # Determine completion status
+    is_complete = len(files_missing) == 0  # All required files must exist
+    
+    if is_complete:
+        state = IndexingState.COMPLETED
+        progress_message = f"Indexing completed successfully. Found {len(files_found)} index files."
+    elif len(files_found) > 0:
+        state = IndexingState.IN_PROGRESS
+        progress_message = f"Indexing in progress. Found {len(files_found)} of {len(required_files)} required files."
+    else:
+        # Check if index directory exists at all
+        if not index_dir_path.exists():
+            state = IndexingState.NOT_STARTED
+            progress_message = "Indexing not started. Index directory does not exist."
+        else:
+            state = IndexingState.IN_PROGRESS
+            progress_message = "Indexing may have started but no files detected yet."
+    
+    logger.info(f"Indexing completion check: {state.value} - {progress_message}")
+    
+    return IndexingStatusCheck(
+        state=state,
+        progress_message=progress_message,
+        files_found=files_found,
+        files_missing=files_missing,
+        is_complete=is_complete
+    )
 
 @router.post("/chat/stream", tags=["Chat"])
 async def stream_chat(query: ChatQuery):

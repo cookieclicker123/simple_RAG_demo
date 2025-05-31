@@ -37,4 +37,21 @@ class IndexCheckResult(BaseModel):
 class UserConfirmation(BaseModel):
     confirmed: bool
     action: str  # What action the user is confirming (e.g., "index_documents", "proceed_anyway")
-    message: str 
+    message: str
+
+# New schemas for indexing completion detection
+class IndexingState(str, Enum):
+    NOT_STARTED = "not_started"
+    IN_PROGRESS = "in_progress" 
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+class IndexingStatusCheck(BaseModel):
+    state: IndexingState
+    progress_message: str
+    files_found: List[str]  # List of required files that were found
+    files_missing: List[str]  # List of required files that are missing
+    is_complete: bool
+
+class IndexCompletionRequest(BaseModel):
+    check_files: bool = True  # Whether to check file structure for completion 

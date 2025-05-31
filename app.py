@@ -7,6 +7,8 @@ from typing import Optional
 
 # Import the new schemas for type safety
 from src.server.schemas import IndexStatus, IndexCheckResult, UserConfirmation
+# Import additional schemas for indexing completion detection
+from src.server.schemas import IndexingState, IndexingStatusCheck, IndexCompletionRequest
 
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,6 +21,7 @@ API_BASE_URL = "http://localhost:8000/api"
 STREAM_CHAT_ENDPOINT = f"{API_BASE_URL}/chat/stream"
 INDEX_STATUS_ENDPOINT = f"{API_BASE_URL}/index/status"
 TRIGGER_INDEX_ENDPOINT = f"{API_BASE_URL}/index/documents"
+CHECK_INDEXING_COMPLETION_ENDPOINT = f"{API_BASE_URL}/index/check-completion"
 
 async def get_enhanced_index_status() -> Optional[IndexCheckResult]:
     """
@@ -176,11 +179,25 @@ async def check_and_manage_index() -> bool:
                 success = await trigger_server_indexing()
                 if success:
                     print("✅ Indexing initiated successfully.")
-                    print("⏳ Please wait for indexing to complete...")
-                    input("Press Enter when you believe indexing is complete to continue...")
-                    # After indexing is complete, go DIRECTLY to chat
-                    print("✅ Proceeding to chat with newly created index.")
-                    return True  # Ready to chat
+                    
+                    # Use automatic polling instead of manual user input
+                    polling_success = await poll_for_indexing_completion(poll_interval=1.0, max_wait_time=300.0)
+                    if polling_success:
+                        print("✅ Proceeding to chat with newly created index.")
+                        return True  # Ready to chat
+                    else:
+                        print("❌ Indexing completion could not be confirmed.")
+                        # Ask if they want to try again or proceed anyway
+                        proceed_confirmation = get_user_confirmation(
+                            "Would you like to proceed to chat anyway (indexing may still be in progress)",
+                            "proceed_anyway"
+                        )
+                        if proceed_confirmation.confirmed:
+                            print("✅ Proceeding to chat (indexing may still be running).")
+                            return True
+                        else:
+                            print("Please check server logs and try again.")
+                            return False
                 else:
                     print("❌ Failed to initiate indexing. Please check server logs.")
                     # Ask if they want to try again
@@ -219,10 +236,16 @@ async def check_and_manage_index() -> bool:
             success = await trigger_server_indexing()
             if success:
                 print("✅ Re-indexing initiated successfully.")
-                input("Press Enter when you believe re-indexing is complete to continue...")
-                # After re-indexing is complete, go DIRECTLY to chat
-                print("✅ Proceeding to chat with updated index.")
-                return True  # Ready to chat
+                
+                # Use automatic polling instead of manual user input
+                polling_success = await poll_for_indexing_completion(poll_interval=1.0, max_wait_time=300.0)
+                if polling_success:
+                    print("✅ Proceeding to chat with updated index.")
+                    return True  # Ready to chat
+                else:
+                    print("❌ Re-indexing completion could not be confirmed.")
+                    print("Proceeding with existing index.")
+                    return True  # Ready to chat with existing index
             else:
                 print("❌ Failed to initiate re-indexing.")
                 print("Proceeding with existing index.")
@@ -286,6 +309,58 @@ async def get_streaming_chat_response(query: str):
         logger.error(f"An unexpected error occurred while streaming: {e}", exc_info=True)
         print(f"\nAn unexpected error occurred: {e}", flush=True)
         yield {"event": "error", "data": f"Unexpected streaming error: {e}"}
+
+async def poll_for_indexing_completion(poll_interval: float = 1.0, max_wait_time: float = 300.0) -> bool:
+    """
+    Polls the server to check if indexing is complete by verifying file structure.
+    Returns True if indexing completed successfully, False if timeout or error.
+    """
+    import time
+    start_time = time.time()
+    print("🔍 Monitoring indexing progress...")
+    
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    CHECK_INDEXING_COMPLETION_ENDPOINT, 
+                    json={"check_files": True}
+                )
+                response.raise_for_status()
+                completion_data = response.json()
+                
+                # Parse the response into our schema
+                status_check = IndexingStatusCheck(**completion_data)
+                
+                print(f"📊 {status_check.progress_message}")
+                
+                if status_check.is_complete:
+                    print("✅ Indexing completed successfully!")
+                    return True
+                elif status_check.state == IndexingState.FAILED:
+                    print("❌ Indexing appears to have failed.")
+                    return False
+                elif status_check.state == IndexingState.IN_PROGRESS:
+                    print(f"⏳ Still indexing... Found {len(status_check.files_found)} files so far.")
+                
+                # Check timeout
+                elapsed_time = time.time() - start_time
+                if elapsed_time > max_wait_time:
+                    print(f"⏰ Timeout reached ({max_wait_time}s). Indexing may still be in progress.")
+                    print("You can check server logs for more details.")
+                    return False
+                
+                # Wait before next poll
+                await asyncio.sleep(poll_interval)
+                
+        except httpx.RequestError as e:
+            logger.error(f"Error polling indexing completion: {e}")
+            print(f"❌ Error checking indexing status: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error during polling: {e}", exc_info=True)
+            print(f"❌ Unexpected error: {e}")
+            return False
 
 async def main():
     print("Interactive Chat with RAG API (type 'exit' or 'quit' to end)")
