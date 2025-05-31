@@ -16,6 +16,8 @@ from src.config import settings # Import settings for paths
 
 # Add new imports for indexing completion detection
 from src.server.schemas import IndexingState, IndexingStatusCheck, IndexCompletionRequest
+# Import utilities for DRY code
+from src.utils.index_manager import IndexFileStructure
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -87,36 +89,9 @@ async def check_indexing_completion(request: IndexCompletionRequest):
     """
     logger.info("Received request to check indexing completion status.")
     
-    # Define the required files for a complete index based on indexing_service.py
+    # Use utility to get required files and check existence
     index_dir_path = Path(settings.vector_store_path)
-    
-    required_files = {
-        "faiss_index": index_dir_path / "vector_store" / "default__vector_store.faiss",
-        "docstore": index_dir_path / "docstore.json",
-        "index_store": index_dir_path / "index_store.json",
-        "bm25_engine": index_dir_path / "bm25_engine.pkl"
-    }
-    
-    # No optional files - all above are required
-    optional_files = {}
-    
-    files_found = []
-    files_missing = []
-    
-    # Check required files
-    for file_key, file_path in required_files.items():
-        if file_path.exists() and file_path.is_file():
-            files_found.append(str(file_path))
-            logger.debug(f"Found required file: {file_path}")
-        else:
-            files_missing.append(str(file_path))
-            logger.debug(f"Missing required file: {file_path}")
-    
-    # Check optional files (just for reporting, don't affect completion status)
-    for file_key, file_path in optional_files.items():
-        if file_path.exists() and file_path.is_file():
-            files_found.append(str(file_path))
-            logger.debug(f"Found optional file: {file_path}")
+    files_found, files_missing = IndexFileStructure.check_files_exist(index_dir_path)
     
     # Determine completion status
     is_complete = len(files_missing) == 0  # All required files must exist
@@ -126,7 +101,7 @@ async def check_indexing_completion(request: IndexCompletionRequest):
         progress_message = f"Indexing completed successfully. Found {len(files_found)} index files."
     elif len(files_found) > 0:
         state = IndexingState.IN_PROGRESS
-        progress_message = f"Indexing in progress. Found {len(files_found)} of {len(required_files)} required files."
+        progress_message = f"Indexing in progress. Found {len(files_found)} of {len(settings.required_index_files)} required files."
     else:
         # Check if index directory exists at all
         if not index_dir_path.exists():
@@ -156,15 +131,17 @@ async def cleanup_existing_index():
     
     try:
         index_dir_path = Path(settings.vector_store_path)
+        
+        # Use utility to get required files for cleanup
+        required_files = IndexFileStructure.get_required_files(index_dir_path)
         files_deleted = []
         
-        # List of files/directories to clean up
+        # Add vector_store directory for complete cleanup
         cleanup_targets = [
-            index_dir_path / "vector_store",  # Entire vector_store directory
-            index_dir_path / "docstore.json",
-            index_dir_path / "index_store.json", 
-            index_dir_path / "bm25_engine.pkl"
+            index_dir_path / "vector_store"  # Entire vector_store directory
         ]
+        # Add individual files
+        cleanup_targets.extend(required_files.values())
         
         for target in cleanup_targets:
             if target.exists():
@@ -220,12 +197,13 @@ async def stream_chat(query: ChatQuery):
                         if item.startswith("Error:") or item.startswith("Sorry, an error occurred:"):
                             logger.error(f"Request [{request_id}] Error token in stream: {item}")
                             payload = {"token": item, "error": True}
-                        # elif item == "QA_SERVICE_STREAM_ENDED_SENTINEL":
-                            # Let this fall through to be sent as a token, as original behavior showed.
-                            # logger.debug(f"Request [{request_id}] Sentinel received, will be sent as token.")
-                        #    payload = {"token": item} # Ensure it's packaged as a token
+                        elif item == "QA_SERVICE_STREAM_ENDED_SENTINEL":
+                            # Sentinel received - this signals the end of the QA service stream
+                            # Don't send this to the client, just continue to the finally block
+                            logger.debug(f"Request [{request_id}] Sentinel received, stream ending.")
+                            break
                         else:
-                            payload = {"token": item} # This will package the sentinel too
+                            payload = {"token": item}
                     elif isinstance(item, list): 
                         logger.debug(f"Request [{request_id}] Event_gen item #{event_count} (list): count {len(item)}")
                         if all(isinstance(dc, DocumentCitation) for dc in item) or not item:

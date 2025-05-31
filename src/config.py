@@ -60,6 +60,23 @@ class AppSettings(BaseSettings):
     chat_memory_token_limit: int = 3000
     chat_engine_verbose: bool = True
 
+    # API Client Configuration
+    api_base_url: str = "http://localhost:8000/api"
+    api_timeout_default: float = 10.0
+    api_timeout_long: float = 30.0
+    
+    # Polling Configuration
+    polling_interval_seconds: float = 1.0
+    polling_max_wait_seconds: float = 300.0
+    
+    # Index File Structure Configuration
+    required_index_files: list[str] = [
+        "vector_store/default__vector_store.faiss",
+        "docstore.json", 
+        "index_store.json",
+        "bm25_engine.pkl"
+    ]
+
 settings = AppSettings()
 
 # Ensure necessary directories exist (data and local_db parent)
