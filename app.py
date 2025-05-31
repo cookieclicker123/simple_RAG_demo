@@ -22,6 +22,7 @@ STREAM_CHAT_ENDPOINT = f"{API_BASE_URL}/chat/stream"
 INDEX_STATUS_ENDPOINT = f"{API_BASE_URL}/index/status"
 TRIGGER_INDEX_ENDPOINT = f"{API_BASE_URL}/index/documents"
 CHECK_INDEXING_COMPLETION_ENDPOINT = f"{API_BASE_URL}/index/check-completion"
+CLEANUP_INDEX_ENDPOINT = f"{API_BASE_URL}/index/cleanup"
 
 async def get_enhanced_index_status() -> Optional[IndexCheckResult]:
     """
@@ -89,8 +90,14 @@ def get_user_confirmation(prompt: str, action: str) -> UserConfirmation:
                     action=action,
                     message=f"User declined: {action}"
                 )
+            elif user_input in ['exit', 'quit']:
+                return UserConfirmation(
+                    confirmed=False,
+                    action="exit",
+                    message="User chose to exit"
+                )
             else:
-                print("Invalid input. Please type 'yes' or 'no'.")
+                print("Invalid input. Please type 'yes', 'no', or 'exit'.")
         except (KeyboardInterrupt, EOFError):
             print("\nOperation cancelled by user.")
             return UserConfirmation(
@@ -140,6 +147,44 @@ async def trigger_server_indexing() -> bool:
         logger.error(f"Unexpected error triggering indexing: {e}", exc_info=True)
         print(f"\nAn unexpected error occurred while trying to start indexing: {e}")
     return False
+
+async def delete_existing_index() -> bool:
+    """
+    Deletes existing index files to prepare for re-indexing.
+    Returns True if successful or no files to delete, False if error.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.delete(CLEANUP_INDEX_ENDPOINT)
+            response.raise_for_status()
+            cleanup_data = response.json()
+            
+            message = cleanup_data.get('message', 'Cleanup completed')
+            files_deleted = cleanup_data.get('files_deleted', [])
+            
+            if files_deleted:
+                print(f"🗑️  {message}")
+                for file_info in files_deleted[:3]:  # Show first 3 files to avoid clutter
+                    print(f"    - Deleted {file_info}")
+                if len(files_deleted) > 3:
+                    print(f"    - ... and {len(files_deleted) - 3} more file(s)")
+            else:
+                print(f"ℹ️  {message}")
+            
+            return True
+            
+    except httpx.RequestError as e:
+        logger.error(f"Error requesting index cleanup: {e}")
+        print(f"❌ Could not connect to server for cleanup: {e}")
+        return False
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Server error during cleanup: {e.response.status_code} - {e.response.text}")
+        print(f"❌ Server error during cleanup: {e.response.status_code}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error during cleanup: {e}", exc_info=True)
+        print(f"❌ Unexpected error during cleanup: {e}")
+        return False
 
 async def check_and_manage_index() -> bool:
     """
@@ -210,6 +255,9 @@ async def check_and_manage_index() -> bool:
                         return False
                     # Continue loop to try again
                     continue
+            elif confirmation.action == "exit":
+                print("👋 Exiting application as requested.")
+                return False
             else:
                 # User declined indexing - but we need it, so ask again
                 print("⚠️  Indexing is required to enable chat functionality.")
@@ -233,6 +281,12 @@ async def check_and_manage_index() -> bool:
         )
         
         if reindex_confirmation.confirmed:
+            # First, clean up existing index files to prevent false completion detection
+            print("🧹 Cleaning up existing index files before re-indexing...")
+            cleanup_success = await delete_existing_index()
+            if not cleanup_success:
+                print("⚠️  Warning: Could not fully clean existing index files, but proceeding anyway.")
+            
             success = await trigger_server_indexing()
             if success:
                 print("✅ Re-indexing initiated successfully.")

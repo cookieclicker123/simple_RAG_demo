@@ -146,6 +146,53 @@ async def check_indexing_completion(request: IndexCompletionRequest):
         is_complete=is_complete
     )
 
+@router.delete("/index/cleanup", tags=["Indexing"])
+async def cleanup_existing_index():
+    """
+    Deletes existing index files to prepare for re-indexing.
+    This prevents false completion detection when re-indexing.
+    """
+    logger.info("Received request to clean up existing index files.")
+    
+    try:
+        index_dir_path = Path(settings.vector_store_path)
+        files_deleted = []
+        
+        # List of files/directories to clean up
+        cleanup_targets = [
+            index_dir_path / "vector_store",  # Entire vector_store directory
+            index_dir_path / "docstore.json",
+            index_dir_path / "index_store.json", 
+            index_dir_path / "bm25_engine.pkl"
+        ]
+        
+        for target in cleanup_targets:
+            if target.exists():
+                try:
+                    if target.is_dir():
+                        import shutil
+                        shutil.rmtree(target)
+                        files_deleted.append(f"directory: {target}")
+                    else:
+                        target.unlink()
+                        files_deleted.append(f"file: {target}")
+                    logger.info(f"Deleted: {target}")
+                except Exception as e:
+                    logger.warning(f"Could not delete {target}: {e}")
+        
+        if files_deleted:
+            message = f"Successfully cleaned up {len(files_deleted)} index file(s)/directory(ies)"
+            logger.info(f"Index cleanup completed: {message}")
+        else:
+            message = "No existing index files found to clean up"
+            logger.info(message)
+            
+        return {"message": message, "files_deleted": files_deleted}
+        
+    except Exception as e:
+        logger.error(f"Error during index cleanup: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to clean up index files: {str(e)}")
+
 @router.post("/chat/stream", tags=["Chat"])
 async def stream_chat(query: ChatQuery):
     """
