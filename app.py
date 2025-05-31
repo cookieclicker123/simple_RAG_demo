@@ -2,6 +2,7 @@ import asyncio
 import httpx
 import json
 import logging
+import uuid
 
 # Import the new schemas for type safety
 from src.server.schemas import IndexStatus
@@ -13,6 +14,7 @@ from src.utils.index_manager import index_manager
 from src.utils.polling import poll_for_indexing_completion
 from src.utils.user_interaction import user_prompts
 from src.utils.http_client import api_client
+from src.config import settings
 
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -20,6 +22,9 @@ logger = logging.getLogger(__name__)
 
 # Set httpx logger level to WARNING to reduce verbosity
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# Global conversation session ID for in-session memory
+current_session_id = None
 
 async def check_and_manage_index() -> bool:
     """
@@ -154,8 +159,19 @@ async def check_and_manage_index() -> bool:
 async def get_streaming_chat_response(query: str):
     """
     Connects to the FastAPI streaming endpoint and yields response tokens.
+    Now includes session management for conversation memory.
     """
-    payload = {"query": query}
+    global current_session_id
+    
+    # Initialize session ID if not already set
+    if not current_session_id:
+        current_session_id = str(uuid.uuid4())
+        logger.info(f"Started new conversation session: {current_session_id}")
+    
+    payload = {
+        "query": query,
+        "session_id": current_session_id
+    }
     stream_endpoint = api_client.endpoints['stream_chat']
     
     try:
@@ -168,6 +184,12 @@ async def get_streaming_chat_response(query: str):
                     print(f"Details: {error_content.decode()}", flush=True)
                     yield {"event": "error", "data": f"Server error: {response.status_code}"} # Yield error event
                     return
+
+                # Check for new session ID in response headers
+                new_session_id = response.headers.get("X-Session-ID")
+                if new_session_id and new_session_id != current_session_id:
+                    current_session_id = new_session_id
+                    logger.info(f"Session ID updated: {current_session_id}")
 
                 # Process the Server-Sent Events (SSE) stream
                 buffer = ""
@@ -198,6 +220,57 @@ async def get_streaming_chat_response(query: str):
         print(f"\nAn unexpected error occurred: {e}", flush=True)
         yield {"event": "error", "data": f"Unexpected streaming error: {e}"}
 
+async def clear_conversation_memory():
+    """Clear the current conversation memory."""
+    global current_session_id
+    
+    if not current_session_id:
+        print("No active conversation to clear.")
+        return
+    
+    try:
+        clear_endpoint = f"{api_client.base_url}/chat/memory/{current_session_id}"
+        async with httpx.AsyncClient() as client:
+            response = await client.delete(clear_endpoint)
+            if response.status_code == 200:
+                print(f"✅ Conversation memory cleared.")
+                current_session_id = None  # Reset session
+            else:
+                print(f"⚠️  Failed to clear conversation memory: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Error clearing conversation memory: {e}")
+        print(f"⚠️  Error clearing conversation memory: {e}")
+
+async def show_conversation_memory():
+    """Show the current conversation history."""
+    global current_session_id
+    
+    if not current_session_id:
+        print("No active conversation.")
+        return
+    
+    try:
+        memory_endpoint = f"{api_client.base_url}/chat/memory/{current_session_id}"
+        async with httpx.AsyncClient() as client:
+            response = await client.get(memory_endpoint)
+            if response.status_code == 200:
+                data = response.json()
+                print(f"\n📝 Conversation History (Session: {current_session_id[:8]}...)")
+                print(f"Total turns: {data['total_turns']}")
+                
+                if data['turns']:
+                    for i, turn in enumerate(data['turns'], 1):
+                        print(f"\n--- Turn {i} ({turn['query_type']}) ---")
+                        print(f"You: {turn['user_query']}")
+                        print(f"AI: {turn['ai_response'][:100]}..." if len(turn['ai_response']) > 100 else f"AI: {turn['ai_response']}")
+                else:
+                    print("No conversation history yet.")
+            else:
+                print(f"⚠️  Failed to retrieve conversation memory: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Error retrieving conversation memory: {e}")
+        print(f"⚠️  Error retrieving conversation memory: {e}")
+
 async def main():
     user_prompts.show_app_header()
 
@@ -208,6 +281,13 @@ async def main():
 
     user_prompts.show_section_separator()
     user_prompts.show_chat_start()
+    
+    # Show conversation commands
+    print("\n💡 Conversation Commands:")
+    print("  /clear    - Clear conversation memory")
+    print("  /history  - Show conversation history") 
+    print("  /new      - Start a new conversation")
+    print("  exit/quit - Exit the application\n")
 
     while True:
         try:
@@ -219,10 +299,22 @@ async def main():
             print("\nExiting chat due to EOF...")
             break
 
-        if user_query.lower() in ["exit", "quit"]:
+        # Handle conversation commands
+        if user_query.lower() in ["/clear"]:
+            await clear_conversation_memory()
+            continue
+        elif user_query.lower() in ["/history"]:
+            await show_conversation_memory()
+            continue
+        elif user_query.lower() in ["/new"]:
+            await clear_conversation_memory()
+            current_session_id = None  # Will create new session on next query
+            print("✨ Started a new conversation.")
+            continue
+        elif user_query.lower() in ["exit", "quit"]:
             print("Exiting chat...")
             break
-        if not user_query.strip():
+        elif not user_query.strip():
             continue
 
         print("AI: ", end="", flush=True)

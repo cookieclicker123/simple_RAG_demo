@@ -23,7 +23,8 @@ from src.utils.vector_store_handlers import load_faiss_index_from_storage
 from src.utils.llm_handlers import llm_manager
 from src.utils.citation_handlers import citation_processor
 from src.utils.rag_handlers import rag_processor
-from src.models import DocumentCitation
+from src.utils.query_enhancement import query_enhancer
+from src.models import DocumentCitation, ConversationMemory, QueryEnhancementRequest
 
 logger = logging.getLogger(__name__)
 
@@ -146,9 +147,21 @@ def _create_bm25_retriever(storage_context) -> Optional[BM25Retriever]:
         logger.error(f"Failed to create BM25Retriever on-the-fly: {e}", exc_info=True)
         return None
 
-def stream_chat_response(query: str, chat_engine: BaseChatEngine) -> Generator[Union[str, List[DocumentCitation]], None, None]:
-    """Stream chat response with citations using utilities."""
-    logger.info(f"User query (for streaming with citations): {query}")
+def stream_chat_response_with_memory(
+    query: str, 
+    chat_engine: BaseChatEngine, 
+    conversation_memory: ConversationMemory
+) -> Generator[Union[str, List[DocumentCitation]], None, None]:
+    """
+    Stream chat response with conversation memory and LLM-powered query enhancement.
+    
+    This is the new conversational version that:
+    1. Always uses LLM to assess and enhance queries with conversation context
+    2. Maintains conversation history for LLM context
+    3. Updates memory after successful response
+    """
+    logger.info(f"User query (conversational): {query}")
+    
     try:
         if not isinstance(chat_engine, RetrieverQueryEngine):
             logger.error(f"Engine is not a RetrieverQueryEngine. Type: {type(chat_engine)}. Cannot process.")
@@ -156,12 +169,36 @@ def stream_chat_response(query: str, chat_engine: BaseChatEngine) -> Generator[U
             yield []
             return
 
-        logger.info("Using RetrieverQueryEngine directly, with response_gen for streaming...")
         query_start_time = datetime.now(timezone.utc)
         original_query = query
-        response = chat_engine.query(query)
         
-        # Process streaming response
+        # Step 1: Get conversation history for context
+        conversation_history = conversation_memory.get_conversation_history_text(
+            app_settings.conversation_context_turns
+        )
+        
+        # Step 2: Always use LLM to assess and enhance query
+        enhancement_request = QueryEnhancementRequest(
+            current_query=query,
+            conversation_history=conversation_history
+        )
+        
+        enhancement_result = query_enhancer.enhance_query_with_context(enhancement_request)
+        
+        # Use enhanced query for RAG retrieval
+        retrieval_query = enhancement_result.enhanced_query
+        
+        if enhancement_result.is_contextual:
+            logger.info(f"LLM enhanced contextual query: '{original_query}' → '{retrieval_query}'")
+            logger.info(f"Enhancement reasoning: {enhancement_result.reasoning}")
+        else:
+            logger.debug(f"LLM assessed query as standalone: '{original_query}'")
+        
+        # Step 3: Perform RAG retrieval with enhanced query
+        logger.info("Using RetrieverQueryEngine directly, with response_gen for streaming...")
+        response = chat_engine.query(retrieval_query)
+        
+        # Step 4: Process streaming response (same as before)
         full_response_text_parts = []
         if hasattr(response, 'response_gen') and response.response_gen:
             for token in response.response_gen:
@@ -179,10 +216,10 @@ def stream_chat_response(query: str, chat_engine: BaseChatEngine) -> Generator[U
         
         final_answer_text = "".join(full_response_text_parts)
 
-        # Extract BM25 snippets for observability
-        bm25_raw_snippets = rag_processor.extract_bm25_snippets(chat_engine, original_query)
+        # Step 5: Extract BM25 snippets for observability
+        bm25_raw_snippets = rag_processor.extract_bm25_snippets(chat_engine, retrieval_query)
 
-        # Process source nodes and create citations
+        # Step 6: Process source nodes and create citations
         source_nodes = response.source_nodes if hasattr(response, 'source_nodes') else []
         citations_generated: List[DocumentCitation] = []
         source_node_details = []
@@ -202,10 +239,10 @@ def stream_chat_response(query: str, chat_engine: BaseChatEngine) -> Generator[U
                 source_nodes, citations_generated, llm_for_titles_instance # type: ignore
             )
         
-        # Create and save RAG response using utility
+        # Step 7: Create and save RAG response using utility
         rag_response_data = rag_processor.create_rag_response(
             query_start_time=query_start_time,
-            original_query=original_query,
+            original_query=original_query,  # Use original query for logging
             final_answer_text=final_answer_text,
             source_nodes=source_nodes,
             source_node_details=source_node_details,
@@ -215,12 +252,29 @@ def stream_chat_response(query: str, chat_engine: BaseChatEngine) -> Generator[U
         
         rag_processor.save_rag_response(rag_response_data)
         
+        # Step 8: Update conversation memory after successful response
+        query_type = "contextual" if enhancement_result.is_contextual else "standalone"
+        conversation_memory.add_turn(
+            user_query=original_query,  # Store original query 
+            ai_response=final_answer_text,
+            query_type=query_type
+        )
+        
+        logger.info(f"Updated conversation memory. Total turns: {len(conversation_memory.turns)}")
+        
         yield "QA_SERVICE_STREAM_ENDED_SENTINEL"
         return 
         
     except Exception as e:
-        logger.error(f"Error getting streaming chat response with citations: {e}", exc_info=True)
+        logger.error(f"Error getting streaming chat response with memory: {e}", exc_info=True)
         yield "Sorry, I encountered an error while processing your request."
         yield [] 
     finally:
         pass
+
+# Keep the original function for backward compatibility
+def stream_chat_response(query: str, chat_engine: BaseChatEngine) -> Generator[Union[str, List[DocumentCitation]], None, None]:
+    """Original stream chat response without memory (for backward compatibility)."""
+    # Create empty memory for one-off queries
+    temp_memory = ConversationMemory()
+    return stream_chat_response_with_memory(query, chat_engine, temp_memory)

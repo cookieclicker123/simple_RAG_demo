@@ -6,26 +6,202 @@ import os # Added for os.listdir
 from pathlib import Path # Added for Path operations
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse
+from datetime import datetime
+from typing import Dict, Any, Optional
+from collections import defaultdict
 
-from src.server.schemas import ChatQuery, IndexingResponse, IndexStatusResponse
+from src.server.schemas import ChatQuery, IndexingResponse, IndexStatusResponse, UserQueryRequest, IndexTriggerResponse, IndexingStatusCheck, IndexCompletionRequest, IndexCleanupResponse
 # Import from original services and models for the pre-ADK RAG flow
 from src.server.services import stream_qa_responses, get_chat_engine
-from src.models import DocumentCitation
+from src.models import DocumentCitation, ConversationMemory
 from src.core.indexing_service import run_indexing_pipeline
 from src.config import settings # Import settings for paths
+from src.core.qa_service import initialize_chat_engine, stream_chat_response_with_memory
+from src.utils.index_manager import IndexFileStructure, index_manager
 
 # Add new imports for indexing completion detection
-from src.server.schemas import IndexingState, IndexingStatusCheck, IndexCompletionRequest
+from src.server.schemas import IndexingState
 # Import utilities for DRY code
-from src.utils.index_manager import IndexFileStructure
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Health check endpoint for the router
-@router.get("/health", tags=["Server Health"])
-async def health_check_router():
-    return {"status": "Router is healthy"}
+# Global variables for engine and memory management
+chat_engine = None
+conversation_memories: Dict[str, ConversationMemory] = defaultdict(lambda: ConversationMemory())
+
+@router.on_event("startup")
+async def startup_event():
+    """Initialize the chat engine on application startup."""
+    global chat_engine
+    logger.info("Starting up FastAPI application...")
+    
+    chat_engine = initialize_chat_engine()
+    if chat_engine:
+        logger.info("Chat engine initialized successfully.")
+    else:
+        logger.error("Failed to initialize chat engine!")
+
+@router.get("/")
+async def root():
+    """Root endpoint to check if the API is running."""
+    return {"message": "Simple RAG Demo API is running"}
+
+@router.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "chat_engine_available": chat_engine is not None,
+        "active_conversations": len(conversation_memories)
+    }
+
+@router.post("/chat/stream")
+async def stream_chat(request: UserQueryRequest):
+    """
+    Stream chat responses with optional conversation memory.
+    
+    If session_id is provided, maintains conversation memory across requests.
+    If no session_id, treats as a one-off query.
+    """
+    global chat_engine
+    
+    if not chat_engine:
+        raise HTTPException(status_code=500, detail="Chat engine not initialized")
+    
+    if not request.query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+    
+    # Get or create conversation memory
+    session_id = request.session_id or str(uuid.uuid4())
+    conversation_memory = conversation_memories[session_id]
+    
+    logger.info(f"Processing query for session {session_id}: {request.query}")
+    
+    # Use the new conversational stream function
+    request_id = str(uuid.uuid4())
+    
+    async def generate_response():
+        """Generate streaming response with conversation memory."""
+        try:
+            event_count = 0
+            citations_sent = False
+            
+            for item in stream_chat_response_with_memory(request.query, chat_engine, conversation_memory):
+                event_count += 1
+                
+                if isinstance(item, str):
+                    logger.debug(f"Request [{request_id}] Event_gen item #{event_count} (str): '{item[:100]}...'")
+                    if item.startswith("Error:") or item.startswith("Sorry, an error occurred:"):
+                        logger.error(f"Request [{request_id}] Error token in stream: {item}")
+                        payload = {"token": item, "error": True}
+                    elif item == "QA_SERVICE_STREAM_ENDED_SENTINEL":
+                        # Sentinel received - this signals the end of the QA service stream
+                        # Don't send this to the client, just continue to the finally block
+                        logger.debug(f"Request [{request_id}] Received QA service stream end sentinel")
+                        continue
+                    else:
+                        # Regular content token
+                        payload = {"token": item}
+                    
+                    event_data = f"data: {json.dumps(payload)}\n\n"
+                    yield event_data.encode()
+                
+                elif isinstance(item, list):
+                    # This should be the citations list
+                    logger.debug(f"Request [{request_id}] Event_gen item #{event_count} (list): citations with {len(item)} items")
+                    citations_data = []
+                    for citation in item:
+                        if hasattr(citation, '__dict__'):
+                            citations_data.append(citation.__dict__)
+                        else:
+                            citations_data.append(citation)
+                    
+                    payload = {"citations": citations_data}
+                    event_data = f"data: {json.dumps(payload)}\n\n"
+                    yield event_data.encode()
+                    citations_sent = True
+                
+                else:
+                    # Unexpected type
+                    logger.warning(f"Request [{request_id}] Unexpected item type in stream: {type(item)}")
+                    continue
+                    
+            # Send final event to signal completion
+            logger.info(f"Request [{request_id}] Stream complete. Events sent: {event_count}, Citations sent: {citations_sent}")
+            
+        except Exception as e:
+            logger.error(f"Request [{request_id}] Error in generate_response: {e}", exc_info=True)
+            error_payload = {"token": f"Error: {str(e)}", "error": True}
+            error_event = f"data: {json.dumps(error_payload)}\n\n"
+            yield error_event.encode()
+        
+        finally:
+            # Send stream end event
+            end_payload = {"event": "stream_end"}
+            end_event = f"data: {json.dumps(end_payload)}\n\n"
+            yield end_event.encode()
+            logger.debug(f"Request [{request_id}] Final stream_end event sent")
+
+    return StreamingResponse(
+        generate_response(),
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Session-ID": session_id
+        }
+    )
+
+@router.delete("/chat/memory/{session_id}")
+async def clear_conversation_memory(session_id: str):
+    """Clear conversation memory for a specific session."""
+    if session_id in conversation_memories:
+        del conversation_memories[session_id]
+        logger.info(f"Cleared conversation memory for session: {session_id}")
+        return {"message": f"Conversation memory cleared for session {session_id}"}
+    else:
+        raise HTTPException(status_code=404, detail=f"No conversation found for session {session_id}")
+
+@router.get("/chat/memory/{session_id}")
+async def get_conversation_memory(session_id: str):
+    """Get conversation history for a specific session."""
+    if session_id in conversation_memories:
+        memory = conversation_memories[session_id]
+        turns_data = []
+        for turn in memory.turns:
+            turns_data.append({
+                "user_query": turn.user_query,
+                "ai_response": turn.ai_response,
+                "timestamp": turn.timestamp.isoformat(),
+                "query_type": turn.query_type
+            })
+        
+        return {
+            "session_id": session_id,
+            "total_turns": len(memory.turns),
+            "max_turns": memory.max_turns,
+            "turns": turns_data
+        }
+    else:
+        raise HTTPException(status_code=404, detail=f"No conversation found for session {session_id}")
+
+@router.get("/chat/sessions")
+async def list_active_sessions():
+    """List all active conversation sessions."""
+    sessions = []
+    for session_id, memory in conversation_memories.items():
+        last_activity = memory.turns[-1].timestamp if memory.turns else None
+        sessions.append({
+            "session_id": session_id,
+            "total_turns": len(memory.turns),
+            "last_activity": last_activity.isoformat() if last_activity else None
+        })
+    
+    return {
+        "total_sessions": len(sessions),
+        "sessions": sessions
+    }
 
 @router.get("/index/status", response_model=IndexStatusResponse, tags=["Indexing"])
 async def get_index_status():
@@ -170,81 +346,27 @@ async def cleanup_existing_index():
         logger.error(f"Error during index cleanup: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to clean up index files: {str(e)}")
 
-@router.post("/chat/stream", tags=["Chat"])
-async def stream_chat(query: ChatQuery):
-    """
-    Original endpoint to stream chat responses directly from RAG service.
-    """
-    request_id = str(uuid.uuid4()) # For logging this specific request
-    logger.info(f"Request [{request_id}] Received streaming chat request: {query.query}")
-    try:
-        engine = await get_chat_engine()
-        if not engine:
-            logger.error(f"Request [{request_id}] Chat engine failed to initialize for /chat/stream endpoint.")
-            raise HTTPException(status_code=503, detail="Chat engine is not available.")
+@router.post("/index/trigger", response_model=IndexTriggerResponse)
+async def trigger_indexing(background_tasks: BackgroundTasks):
+    """Trigger the document indexing process."""
+    success = await index_manager.trigger_indexing()
+    return IndexTriggerResponse(success=success)
 
-        async def event_generator():
-            logger.debug(f"Request [{request_id}] event_generator started.")
-            event_count = 0
-            try:
-                async for item in stream_qa_responses(query.query):
-                    event_count += 1
-                    payload = {}
-                    # event_type = "token" # Not strictly needed if payload structure is consistent
+@router.get("/index/status", response_model=IndexingStatusCheck)
+async def get_enhanced_index_status():
+    """Get enhanced index status with document count and detailed messaging."""
+    return await index_manager.get_enhanced_status()
 
-                    if isinstance(item, str):
-                        logger.debug(f"Request [{request_id}] Event_gen item #{event_count} (str): '{item[:100]}...'")
-                        if item.startswith("Error:") or item.startswith("Sorry, an error occurred:"):
-                            logger.error(f"Request [{request_id}] Error token in stream: {item}")
-                            payload = {"token": item, "error": True}
-                        elif item == "QA_SERVICE_STREAM_ENDED_SENTINEL":
-                            # Sentinel received - this signals the end of the QA service stream
-                            # Don't send this to the client, just continue to the finally block
-                            logger.debug(f"Request [{request_id}] Sentinel received, stream ending.")
-                            break
-                        else:
-                            payload = {"token": item}
-                    elif isinstance(item, list): 
-                        logger.debug(f"Request [{request_id}] Event_gen item #{event_count} (list): count {len(item)}")
-                        if all(isinstance(dc, DocumentCitation) for dc in item) or not item:
-                            # event_type = "citations" # Not strictly needed for client if client checks key
-                            payload = {"citations": [dc.model_dump(mode='json') for dc in item]}
-                        else:
-                            logger.warning(f"Request [{request_id}] Received a list that isn't DocumentCitations: {item}")
-                            payload = {"token": f"Internal server error: Unexpected data type in stream.", "error": True}
-                    else:
-                        logger.error(f"Request [{request_id}] Unexpected item type from stream_qa_responses: {type(item)}")
-                        payload = {"token": "Internal server error: Corrupted stream data.", "error": True}
-                    
-                    sse_data = f"data: {json.dumps(payload)}\n\n"
-                    logger.debug(f"Request [{request_id}] Yielding SSE data: {sse_data.strip()}")
-                    yield sse_data
-                    await asyncio.sleep(0.01)
-                
-                logger.info(f"Request [{request_id}] Finished iterating stream_qa_responses. Total items processed by event_gen: {event_count}")
-            except Exception as e_inner:
-                logger.error(f"Request [{request_id}] Exception inside event_generator loop: {e_inner}", exc_info=True)
-                try:
-                    error_payload = {"token": f"Server error during generation: {str(e_inner)}", "error": True}
-                    yield f"data: {json.dumps(error_payload)}\n\n"
-                except Exception as e_yield_error:
-                    logger.error(f"Request [{request_id}] Failed to yield error to client: {e_yield_error}")
-            finally:
-                logger.info(f"Request [{request_id}] event_generator finally block. Attempting to send stream_end.")
-                end_event_payload = {"event": "stream_end"}
-                try:
-                    yield f"data: {json.dumps(end_event_payload)}\n\n"
-                    logger.info(f"Request [{request_id}] Successfully yielded stream_end.")
-                except Exception as e_yield_end:
-                    logger.error(f"Request [{request_id}] Failed to yield stream_end: {e_yield_end}", exc_info=True)
+@router.post("/index/check-completion")
+async def check_indexing_completion(request: IndexCompletionRequest):
+    """Check if indexing process has completed by examining file structure."""
+    return await index_manager.check_completion_status()
 
-        return StreamingResponse(event_generator(), media_type="text/event-stream")
-    
-    except HTTPException as http_exc:
-        raise http_exc
-    except Exception as e:
-        logger.error(f"Request [{request_id}] Unexpected error in /chat/stream endpoint: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+@router.post("/index/cleanup", response_model=IndexCleanupResponse)
+async def cleanup_existing_index():
+    """Clean up existing index files before re-indexing."""
+    success = await index_manager.cleanup_existing()
+    return IndexCleanupResponse(success=success)
 
 # Example of a non-streaming endpoint (can be removed or adapted)
 @router.post("/chat/simple", tags=["Chat"])

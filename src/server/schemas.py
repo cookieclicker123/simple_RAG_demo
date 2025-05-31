@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List # Optional might be used by IndexingResponse, List for ChatQuery history
 from enum import Enum
 
@@ -55,3 +55,16 @@ class IndexingStatusCheck(BaseModel):
 
 class IndexCompletionRequest(BaseModel):
     check_files: bool = True  # Whether to check file structure for completion 
+
+class IndexCleanupResponse(BaseModel):
+    """Response model for index cleanup operations."""
+    success: bool
+
+class IndexTriggerResponse(BaseModel):
+    """Response model for triggering indexing operations."""
+    success: bool
+
+class UserQueryRequest(BaseModel):
+    """Request model for conversational chat with optional session management."""
+    query: str = Field(..., description="User's question or query")
+    session_id: Optional[str] = Field(None, description="Optional session ID for conversation memory") 

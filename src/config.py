@@ -77,6 +77,24 @@ class AppSettings(BaseSettings):
         "bm25_engine.pkl"
     ]
 
+    # RAG response processing
+    rag_response_output_dir: str = "tmp"
+    
+    # Conversation memory settings
+    conversation_max_turns: int = 10
+    conversation_context_turns: int = 3
+    query_enhancement_model: str = "gpt-4o-mini"
+    query_enhancement_temperature: float = 0.1
+    
+    def __post_init__(self):
+        """Validate and process configuration after initialization."""
+        # Convert relative paths to absolute
+        if not os.path.isabs(self.vector_store_path):
+            self.vector_store_path = os.path.abspath(self.vector_store_path)
+        
+        if not os.path.isabs(self.rag_response_output_dir):
+            self.rag_response_output_dir = os.path.abspath(self.rag_response_output_dir)
+
 settings = AppSettings()
 
 # Ensure necessary directories exist (data and local_db parent)
