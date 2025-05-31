@@ -319,6 +319,10 @@ async def poll_for_indexing_completion(poll_interval: float = 1.0, max_wait_time
     start_time = time.time()
     print("🔍 Monitoring indexing progress...")
     
+    last_state = None
+    last_files_count = -1
+    shown_completion_message = False
+    
     while True:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -332,16 +336,34 @@ async def poll_for_indexing_completion(poll_interval: float = 1.0, max_wait_time
                 # Parse the response into our schema
                 status_check = IndexingStatusCheck(**completion_data)
                 
-                print(f"📊 {status_check.progress_message}")
+                # Only show updates on state changes or meaningful progress
+                current_files_count = len(status_check.files_found)
+                state_changed = last_state != status_check.state
+                files_progress = current_files_count > last_files_count
                 
-                if status_check.is_complete:
+                if status_check.is_complete and not shown_completion_message:
                     print("✅ Indexing completed successfully!")
                     return True
                 elif status_check.state == IndexingState.FAILED:
                     print("❌ Indexing appears to have failed.")
                     return False
-                elif status_check.state == IndexingState.IN_PROGRESS:
-                    print(f"⏳ Still indexing... Found {len(status_check.files_found)} files so far.")
+                elif state_changed or files_progress:
+                    if status_check.state == IndexingState.NOT_STARTED:
+                        if state_changed:  # Only show this once when transitioning to NOT_STARTED
+                            print("⏳ Waiting for indexing to begin...")
+                    elif status_check.state == IndexingState.IN_PROGRESS:
+                        if current_files_count == 0 and state_changed:
+                            print("📝 Document processing started...")
+                        elif current_files_count > 0 and files_progress:
+                            # Estimate progress based on files created (rough heuristic)
+                            if current_files_count >= 3:  # Most core files created
+                                print("📄 Document processing nearly complete...")
+                            elif current_files_count >= 1:  # Some files created
+                                print("📄 Document processing in progress...")
+                
+                # Update tracking variables
+                last_state = status_check.state
+                last_files_count = current_files_count
                 
                 # Check timeout
                 elapsed_time = time.time() - start_time
