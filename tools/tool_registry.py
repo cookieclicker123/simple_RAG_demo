@@ -18,7 +18,6 @@ from typing import Dict, List, Optional, Any, Callable, Awaitable
 from agents.agent_models import ToolResult
 
 from tools.tool_models import ToolSchema
-from tools.rag_tool import rag_tool, get_rag_tool_schema
 
 logger = logging.getLogger(__name__)
 
@@ -37,18 +36,31 @@ class ToolRegistry:
         self._tools: Dict[str, Callable[[str, Dict[str, Any]], Awaitable[ToolResult]]] = {}
         self._schemas: Dict[str, ToolSchema] = {}
         self._categories: Dict[str, List[str]] = {}
+        self._core_tools_registered = False
         
-        # Register core tools
-        self._register_core_tools()
-        
-        logger.info("Tool registry initialized with core tools")
+        logger.info("Tool registry initialized - core tools will be registered on first access")
     
-    def _register_core_tools(self) -> None:
-        """Register the core tools that are always available."""
-        # Register RAG tool
-        self.register_tool("rag_tool", rag_tool, get_rag_tool_schema())
-        
-        logger.info("Core tools registered: rag_tool")
+    def _ensure_core_tools_registered(self) -> None:
+        """Ensure core tools are registered (deferred to avoid circular imports)."""
+        if self._core_tools_registered:
+            return
+            
+        try:
+            # Import here to avoid circular imports
+            from tools.rag_tool import rag_tool, get_rag_tool_schema
+            from tools.translator_tool import translator_tool, get_translator_tool_schema
+            
+            # Register RAG tool
+            self.register_tool("rag_tool", rag_tool, get_rag_tool_schema())
+            
+            # Register translator tool
+            self.register_tool("translator_tool", translator_tool, get_translator_tool_schema())
+            
+            self._core_tools_registered = True
+            logger.info("Core tools registered: rag_tool, translator_tool")
+            
+        except Exception as e:
+            logger.error(f"Failed to register core tools: {e}", exc_info=True)
     
     def register_tool(
         self, 
@@ -127,6 +139,7 @@ class ToolRegistry:
         Returns:
             Tool function if found, None otherwise
         """
+        self._ensure_core_tools_registered()
         return self._tools.get(name)
     
     def get_schema(self, name: str) -> Optional[ToolSchema]:
@@ -139,6 +152,7 @@ class ToolRegistry:
         Returns:
             Tool schema if found, None otherwise
         """
+        self._ensure_core_tools_registered()
         return self._schemas.get(name)
     
     def list_tools(self) -> List[str]:
@@ -148,6 +162,7 @@ class ToolRegistry:
         Returns:
             List of tool names
         """
+        self._ensure_core_tools_registered()
         return list(self._tools.keys())
     
     def list_categories(self) -> List[str]:
@@ -157,6 +172,7 @@ class ToolRegistry:
         Returns:
             List of category names
         """
+        self._ensure_core_tools_registered()
         return list(self._categories.keys())
     
     def get_tools_by_category(self, category: str) -> List[str]:
@@ -169,6 +185,7 @@ class ToolRegistry:
         Returns:
             List of tool names in the category
         """
+        self._ensure_core_tools_registered()
         return self._categories.get(category, [])
     
     def search_tools(self, query: str) -> List[str]:
@@ -181,6 +198,7 @@ class ToolRegistry:
         Returns:
             List of matching tool names
         """
+        self._ensure_core_tools_registered()
         query_lower = query.lower()
         matches = []
         
@@ -205,76 +223,106 @@ class ToolRegistry:
     
     async def execute_tool(
         self, 
-        name: str, 
+        tool_name: str, 
         query: str, 
-        parameters: Optional[Dict[str, Any]] = None
+        parameters: Dict[str, Any]
     ) -> ToolResult:
         """
-        Execute a tool by name with given parameters.
+        Execute a tool with given parameters.
         
         Args:
-            name: Name of the tool to execute
-            query: Query string for the tool
-            parameters: Tool-specific parameters
+            tool_name: Name of the tool to execute
+            query: Query/description for the tool execution
+            parameters: Parameters to pass to the tool
             
         Returns:
-            ToolResult from tool execution
+            ToolResult containing execution results
             
         Raises:
-            ValueError: If tool not found
-            Exception: If tool execution fails
+            ValueError: If tool is not found or parameters are invalid
         """
-        tool_function = self.get_tool(name)
-        if not tool_function:
-            raise ValueError(f"Tool '{name}' not found in registry")
+        self._ensure_core_tools_registered()
         
-        if parameters is None:
-            parameters = {}
+        tool_func = self._tools.get(tool_name)
+        if not tool_func:
+            available_tools = list(self._tools.keys())
+            raise ValueError(f"Tool '{tool_name}' not found. Available tools: {available_tools}")
         
-        logger.info(f"Executing tool: {name}")
-        logger.debug(f"Query: {query}")
-        logger.debug(f"Parameters: {parameters}")
+        # Get schema for validation
+        schema = self._schemas.get(tool_name)
+        if schema:
+            # Validate parameters against schema
+            validation_errors = self.validate_parameters(tool_name, parameters)
+            if validation_errors:
+                raise ValueError(f"Parameter validation failed for tool '{tool_name}': {validation_errors}")
         
-        return await tool_function(query, parameters)
+        # Execute the tool
+        logger.debug(f"Executing tool '{tool_name}' with query: {query}")
+        result = await tool_func(query, parameters)
+        logger.debug(f"Tool '{tool_name}' execution completed with status: {result.status}")
+        
+        return result
     
     def validate_parameters(self, tool_name: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Validate parameters for a specific tool.
+        Validate tool parameters against the tool's schema.
         
         Args:
             tool_name: Name of the tool
             parameters: Parameters to validate
             
         Returns:
-            Validated parameters with defaults applied
-            
-        Raises:
-            ValueError: If tool not found or parameters invalid
+            Dictionary of validation errors (empty if valid)
         """
-        schema = self.get_schema(tool_name)
-        if not schema:
-            raise ValueError(f"Tool '{tool_name}' not found")
+        self._ensure_core_tools_registered()
         
-        validated = {}
+        schema = self._schemas.get(tool_name)
+        if not schema:
+            return {"schema": f"No schema found for tool '{tool_name}'"}
+        
+        errors = {}
         
         # Check required parameters
+        required_params = [p.name for p in schema.parameters if p.required]
+        for param in required_params:
+            if param not in parameters:
+                errors[param] = f"Required parameter '{param}' is missing"
+        
+        # Validate each parameter
         for param in schema.parameters:
-            if param.required and param.name not in parameters:
-                raise ValueError(f"Required parameter '{param.name}' missing for tool '{tool_name}'")
-            
-            value = parameters.get(param.name, param.default_value)
-            
-            if value is not None:
-                # Type validation would go here
-                # For now, just pass through
-                validated[param.name] = value
+            if param.name in parameters:
+                value = parameters[param.name]
+                param_errors = self._validate_parameter(param, value)
+                if param_errors:
+                    errors[param.name] = param_errors
         
-        # Add any extra parameters (flexible approach)
-        for key, value in parameters.items():
-            if key not in validated:
-                validated[key] = value
+        return errors
+    
+    def _validate_parameter(self, param: Any, value: Any) -> Optional[str]:
+        """
+        Validate a single parameter value against its schema.
         
-        return validated
+        Args:
+            param: Parameter definition from schema
+            value: Value to validate
+            
+        Returns:
+            Error message if invalid, None if valid
+        """
+        # Basic type validation
+        if hasattr(param, 'allowed_values') and param.allowed_values:
+            if value not in param.allowed_values:
+                return f"Value must be one of {param.allowed_values}, got '{value}'"
+        
+        if hasattr(param, 'min_length') and param.min_length is not None:
+            if isinstance(value, str) and len(value) < param.min_length:
+                return f"String too short, minimum length is {param.min_length}"
+        
+        if hasattr(param, 'max_length') and param.max_length is not None:
+            if isinstance(value, str) and len(value) > param.max_length:
+                return f"String too long, maximum length is {param.max_length}"
+        
+        return None
     
     def get_tool_info(self, name: str) -> Optional[Dict[str, Any]]:
         """

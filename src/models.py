@@ -197,4 +197,55 @@ class QueryEnhancementResult:
     enhanced_query: str
     is_contextual: bool
     reasoning: str
-    confidence: float 
+    confidence: float
+
+class LanguageDetectionAssessment(BaseModel):
+    """
+    LLM assessment of user input language for translation workflow routing.
+    
+    This model represents the structured response from an LLM that analyzes
+    the primary language of user input to determine if translation is needed
+    before processing through the RAG system.
+    
+    Supports English (primary processing language) and Chinese (requires translation).
+    Mixed-language inputs are classified by their dominant language.
+    
+    Examples:
+        English: "What is the company's revenue?" -> no translation needed
+        Chinese: "公司的收入是多少？" -> translate to English, process, translate back
+        Mixed: "Apple公司的revenue如何？" -> dominant language determines workflow
+    """
+    detected_language: Literal["en", "zh"] = Field(
+        description="Detected primary language code: 'en' for English, 'zh' for Chinese"
+    )
+    confidence: float = Field(
+        ge=0.0, le=1.0,
+        description="Confidence score for language detection accuracy (0.0-1.0)"
+    )
+    needs_translation: bool = Field(
+        description="Whether input requires translation before processing"
+    )
+    reasoning: str = Field(
+        description="Brief explanation of the language detection decision"
+    )
+    translation_direction: Optional[Literal["zh_to_en", "en_to_zh"]] = Field(
+        None,
+        description="Translation direction needed: 'zh_to_en' for Chinese input, null for English"
+    )
+
+@dataclass
+class LanguageDetectionResult:
+    """Result of language detection process."""
+    detected_language: str
+    confidence: float
+    needs_translation: bool
+    reasoning: str
+    translation_direction: Optional[str] = None
+
+@dataclass
+class TranslationRequest:
+    """Request for text translation."""
+    text: str
+    source_language: str
+    target_language: str
+    context: Optional[str] = None 

@@ -27,15 +27,15 @@ class AgentRole(str, Enum):
     Each role defines the agent's primary responsibility and capabilities:
     - META: Orchestrates other agents and handles tool selection
     - RAG: Specialized for retrieval-augmented generation tasks
+    - TRANSLATOR: Language translation and multi-language support
     - CALCULATOR: Mathematical computation and analysis
-    - TRANSLATOR: Language translation services
     - WEB_SEARCH: External information retrieval
     - CUSTOM: User-defined specialized agents
     """
     META = "meta"
     RAG = "rag" 
-    CALCULATOR = "calculator"
     TRANSLATOR = "translator"
+    CALCULATOR = "calculator"
     WEB_SEARCH = "web_search"
     CUSTOM = "custom"
 

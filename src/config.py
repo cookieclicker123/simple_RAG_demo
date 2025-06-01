@@ -20,6 +20,7 @@ class AppSettings(BaseSettings):
 
     # API Keys
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "your_openai_api_key_here_if_not_in_env")
+    google_translate_api_key: str = os.getenv("GOOGLE_TRANSLATE_API_KEY", "your_google_translate_api_key_here_if_not_in_env")
     
     
     # Default Agent LLM (can be overridden per agent)
@@ -85,6 +86,13 @@ class AppSettings(BaseSettings):
     conversation_context_turns: int = 3
     query_enhancement_model: str = "gpt-4o-mini"
     query_enhancement_temperature: float = 0.1
+    
+    # Translation settings
+    translation_service: str = "google"  # google, azure, openai (future)
+    translation_timeout_seconds: float = 10.0
+    translation_retry_attempts: int = 3
+    language_detection_model: str = "gpt-4o-mini"
+    language_detection_temperature: float = 0.1
     
     def __post_init__(self):
         """Validate and process configuration after initialization."""

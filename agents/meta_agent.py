@@ -39,6 +39,7 @@ from src.models import DocumentCitation, QueryEnhancementAssessment
 from src.config import settings as app_settings
 from src.prompts.investor_prompt import INVESTOR_SYSTEM_PROMPT
 from src.prompts.query_enhancement_prompt import get_query_enhancement_system_prompt, QUERY_ENHANCEMENT_USER_PROMPT
+from src.utils.language_detection import language_detector
 
 logger = logging.getLogger(__name__)
 
@@ -180,22 +181,63 @@ async def meta_agent(agent_input: AgentInput) -> AgentResult:
         logger.info(f"Enhanced query: {enhanced_query}")
         logger.info(f"Query type: {is_contextual}, Reasoning: {reasoning}")
         
-        # Step 2: Analyze query and determine tool requirements
+        # Step 2: Language detection and translation workflow
+        original_language = "en"  # Default assumption
+        translated_query = enhanced_query  # Default to enhanced query
+        needs_response_translation = False
+        
+        # Detect language of the original query (not enhanced, as we want to detect user's language)
+        language_result = language_detector.detect_language(agent_input.query)
+        logger.info(f"Language detection: {language_result.detected_language} (confidence: {language_result.confidence:.2f})")
+        logger.info(f"Translation needed: {language_result.needs_translation}")
+        
+        if language_result.needs_translation and language_result.detected_language == "zh":
+            logger.info("Chinese input detected - initiating translation workflow")
+            original_language = "zh"
+            needs_response_translation = True
+            
+            # Translate the enhanced query to English for processing
+            try:
+                translation_result = await tool_registry.execute_tool(
+                    "translator_tool",
+                    f"Translate query for processing: {enhanced_query}",
+                    {
+                        "text": enhanced_query,
+                        "source_language": "zh",
+                        "target_language": "en"
+                    }
+                )
+                
+                if translation_result.status.value == "completed" and translation_result.result_data:
+                    translated_query = translation_result.result_data.translated_text
+                    logger.info(f"Query translated successfully: '{enhanced_query}' → '{translated_query}'")
+                else:
+                    logger.warning(f"Query translation failed: {translation_result.error_message}")
+                    # Continue with enhanced query (might be mixed language)
+                    translated_query = enhanced_query
+                    
+            except Exception as e:
+                logger.error(f"Error translating query: {e}", exc_info=True)
+                # Continue with enhanced query as fallback
+                translated_query = enhanced_query
+        
+        # Step 3: Analyze query and determine tool requirements (using translated query)
         tool_decision = await _analyze_query_for_tools(
-            enhanced_query, 
+            translated_query,  # Use translated query for tool analysis
             agent_input.context.conversation_memory.get_conversation_history_text(5),
             is_contextual
         )
         
         logger.info(f"Tool decision: {tool_decision}")
         
-        # Step 3: Execute tools based on analysis
+        # Step 4: Execute tools based on analysis
         if tool_decision.get("use_rag", False):
             logger.info("Executing RAG tool for document-based financial query")
             
             # Prepare enhanced RAG parameters based on conversation context
             conversation_summary = agent_input.context.conversation_memory.get_conversation_history_text(3)
             rag_params = {
+                "query": translated_query,
                 "max_documents": tool_decision.get("max_documents", 10),
                 "include_citations": True,
                 "conversation_context": conversation_summary
@@ -209,7 +251,7 @@ async def meta_agent(agent_input: AgentInput) -> AgentResult:
             try:
                 rag_result = await tool_registry.execute_tool(
                     "rag_tool", 
-                    enhanced_query, 
+                    translated_query, 
                     rag_params
                 )
                 
@@ -251,21 +293,50 @@ async def meta_agent(agent_input: AgentInput) -> AgentResult:
             conversation_summary = agent_input.context.conversation_memory.get_conversation_history_text(5)
             
             llm_response = await _generate_direct_response(
-                enhanced_query,
+                translated_query,
                 conversation_summary
             )
             
             response_parts.append(llm_response)
             confidence_score = 0.7  # Lower confidence for non-grounded responses
         
-        # Step 4: Synthesize final response
+        # Step 5: Synthesize final response
         final_response = "\n\n".join(response_parts).strip()
         
         if not final_response:
             final_response = "I apologize, but I wasn't able to generate a response to your query. Please try rephrasing your question or check if the system is properly configured."
             confidence_score = 0.1
         
-        # Step 5: Update conversation memory
+        # Step 5.5: Translate response back to original language if needed
+        if needs_response_translation and original_language == "zh":
+            logger.info("Translating response back to Chinese")
+            try:
+                response_translation_result = await tool_registry.execute_tool(
+                    "translator_tool",
+                    f"Translate response back to Chinese: {final_response[:100]}...",
+                    {
+                        "text": final_response,
+                        "source_language": "en", 
+                        "target_language": "zh"
+                    }
+                )
+                
+                if response_translation_result.status.value == "completed" and response_translation_result.result_data:
+                    final_response = response_translation_result.result_data.translated_text
+                    logger.info("Response translated back to Chinese successfully")
+                    
+                    # Add translation info to tools used for transparency
+                    if "translator_tool" not in tools_used:
+                        tools_used.append("translator_tool")
+                else:
+                    logger.warning(f"Response translation failed: {response_translation_result.error_message}")
+                    # Keep English response as fallback
+                    
+            except Exception as e:
+                logger.error(f"Error translating response back to Chinese: {e}", exc_info=True)
+                # Keep English response as fallback
+        
+        # Step 6: Update conversation memory
         if hasattr(agent_input.context.conversation_memory, 'add_turn'):
             query_type = "contextual" if tools_used else "standalone"
             agent_input.context.conversation_memory.add_turn(
@@ -277,7 +348,7 @@ async def meta_agent(agent_input: AgentInput) -> AgentResult:
         else:
             memory_updated = False
         
-        # Step 6: Create agent output
+        # Step 7: Create agent output
         agent_output = AgentOutput(
             response_text=final_response,
             tool_calls_made=tools_used,
@@ -296,9 +367,17 @@ async def meta_agent(agent_input: AgentInput) -> AgentResult:
                     "enhanced_query": enhanced_query,
                     "is_contextual": is_contextual,
                     "enhancement_reasoning": reasoning
+                },
+                "language_workflow": {
+                    "original_language": original_language,
+                    "detected_language": language_result.detected_language,
+                    "detection_confidence": language_result.confidence,
+                    "translation_needed": needs_response_translation,
+                    "translated_query": translated_query if needs_response_translation else None,
+                    "detection_reasoning": language_result.reasoning
                 }
             },
-            next_suggested_actions=_generate_suggested_actions(enhanced_query, tools_used)
+            next_suggested_actions=_generate_suggested_actions(translated_query, tools_used)
         )
         
         # Step 7: Calculate execution metrics
